@@ -28,6 +28,7 @@
 #include "ReSTIR.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Rendering/Lights/EmissiveUniformSampler.h"
 
 namespace
 {
@@ -137,6 +138,58 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
         mpScene->getLightCollection(pRenderContext);
     }
 
+    if (is_set(mUpdateFlags, IScene::UpdateFlags::EnvMapChanged))
+    {
+        mpEnvMapSampler = nullptr;
+        mRecompile = true;
+    }
+
+    if (mpScene->useEnvLight())
+    {
+        if (!mpEnvMapSampler)
+        {
+            mpEnvMapSampler = std::make_unique<EnvMapSampler>(mpDevice, mpScene->getEnvMap());
+            mRecompile = true;
+        }
+    }
+    else
+    {
+        if (mpEnvMapSampler)
+        {
+            mpEnvMapSampler = nullptr;
+            mRecompile = true;
+        }
+    }
+
+    if (mpScene->useEmissiveLights())
+    {
+        if (!mpEmissiveSampler)
+        {
+            const auto& pLights = mpScene->getILightCollection(pRenderContext);
+            FALCOR_ASSERT(pLights && pLights->getActiveLightCount(pRenderContext) > 0);
+            FALCOR_ASSERT(!mpEmissiveSampler);
+
+            mpEmissiveSampler = std::make_unique<EmissiveUniformSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
+            mRecompile = true;
+        }
+    }
+    else
+    {
+        if (mpEmissiveSampler)
+        {
+            mpEmissiveSampler = nullptr;
+            mRecompile = true;
+        }
+    }
+
+    if (mpEmissiveSampler)
+    {
+        mpEmissiveSampler->update(pRenderContext, mpScene->getLightCollection(pRenderContext));
+        auto defines = mpEmissiveSampler->getDefines();
+        if (mTracer.pProgram->addDefines(defines))
+            mRecompile = true;
+    }
+
     setStaticParams(mTracer.pProgram.get());
 
     // For optional I/O resources, set 'is_valid_<name>' defines to inform the program of which ones it can access.
@@ -186,6 +239,9 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
     dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
     widget.tooltip("Compute direct illumination.\nIf disabled only indirect is computed (when max bounces > 0).", true);
 
+    dirty |= widget.checkbox("Use Nee", mUseNee);
+    widget.tooltip("Use Nee.\nIf disabled only bsdf is sampled (when max bounces > 0).", true);
+
     // If rendering options that modify the output have changed, set flag to indicate that.
     // In execute() we will pass the flag to other passes for reset of temporal data etc.
     if (dirty)
@@ -196,6 +252,9 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
 
 void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    mUpdateFlagsConnection = {};
+    mUpdateFlags = IScene::UpdateFlags::None;
+
     // Clear data for previous scene.
     // After changing scene, the raytracing program should to be recreated.
     mTracer.pProgram = nullptr;
@@ -212,6 +271,8 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
         {
             logWarning("ReSTIR: This render pass only supports triangles. Other types of geometry will be ignored.");
         }
+
+        mUpdateFlagsConnection = mpScene->getUpdateFlagsSignal().connect([&](IScene::UpdateFlags flags) { mUpdateFlags |= flags; });
 
         // if (mpScene->hasGeometryType(Scene::GeometryType::DisplacedTriangleMesh))
         // {
@@ -241,20 +302,6 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
             sbt->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowAnyHit"));
         }
 
-        // if (mpScene->hasGeometryType(Scene::GeometryType::DisplacedTriangleMesh))
-        // {
-        //     sbt->setHitGroup(
-        //         0,
-        //         mpScene->getGeometryIDs(Scene::GeometryType::DisplacedTriangleMesh),
-        //         desc.addHitGroup("scatterDisplacedTriangleMeshClosestHit", "", "displacedTriangleMeshIntersection")
-        //     );
-        //     sbt->setHitGroup(
-        //         1,
-        //         mpScene->getGeometryIDs(Scene::GeometryType::DisplacedTriangleMesh),
-        //         desc.addHitGroup("", "", "displacedTriangleMeshIntersection")
-        //     );
-        // }
-
         mTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
     }
 }
@@ -271,9 +318,19 @@ void ReSTIR::prepareVars()
     // This may trigger shader compilation. If it fails, throw an exception to abort rendering.
     mTracer.pVars = RtProgramVars::create(mpDevice, mTracer.pProgram, mTracer.pBindingTable);
 
+    auto reflector = mTracer.pProgram->getReflector()->getParameterBlock("gReSTIRData");
+    mpReSTIRDataBlock = ParameterBlock::create(mpDevice, reflector);
+    FALCOR_ASSERT(mpReSTIRDataBlock);
+
     // Bind utility classes into shared data.
     auto var = mTracer.pVars->getRootVar();
     mpSampleGenerator->bindShaderData(var);
+
+    if (mpEnvMapSampler && mpReSTIRDataBlock)
+        mpEnvMapSampler->bindShaderData(mpReSTIRDataBlock->getRootVar()["envMapSampler"]);
+
+    if (mpEmissiveSampler && mpReSTIRDataBlock)
+        mpEmissiveSampler->bindShaderData(mpReSTIRDataBlock->getRootVar()["emissiveSampler"]);
 }
 
 void ReSTIR::setStaticParams(Program* pProgram) const
@@ -281,6 +338,7 @@ void ReSTIR::setStaticParams(Program* pProgram) const
     DefineList defines;
     defines.add("MAX_BOUNCES", std::to_string(mMaxBounces));
     defines.add("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
+    defines.add("USE_NEE", mUseNee ? "1" : "0");
     // defines.add("TEX_LOD_MODE", std::to_string(static_cast<uint32_t>(mTexLODMode)));
     // defines.add("RAY_CONE_MODE", std::to_string(static_cast<uint32_t>(mRayConeMode)));
     // defines.add("VISUALIZE_SURFACE_SPREAD", mVisualizeSurfaceSpread ? "1" : "0");

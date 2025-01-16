@@ -8,12 +8,18 @@ import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
 import Rendering.Lights.LightHelpers;
-
+import Utils.Math.PackedFormats;
+import Scene.HitInfo;
+import Utils.Math.Ray;
+import Rendering.Materials.InteriorList;
+import Rendering.Lights.EnvMapSampler;
+import Rendering.Lights.EmissiveLightSampler;
+import Rendering.Lights.EmissiveLightSamplerHelpers;
 
 cbuffer CB
 {
-    uint gFrameCount; // Frame count since scene was loaded.
-    uint gPRNGDimension;                // First available PRNG dimension.
+    uint gFrameCount;    // Frame count since scene was loaded.
+    uint gPRNGDimension; // First available PRNG dimension.
 }
 
 // Inputs
@@ -21,9 +27,17 @@ cbuffer CB
 Texture2D<PackedHitInfo> gVBuffer;
 Texture2D<float4> gViewW; // Optional
 
-
 // Outputs
 RWTexture2D<float4> gOutputColor;
+
+struct ReSTIRData
+{
+    // Samplers
+    EnvMapSampler envMapSampler;          ///< Environment map sampler. Only valid when kUseEnvLight == true.
+    EmissiveLightSampler emissiveSampler; ///< Emissive light sampler. Only valid when kUseEmissiveLights == true.
+};
+
+ParameterBlock<ReSTIRData> gReSTIRData;
 
 // Static configuration based on defines set from the host.
 #define is_valid(name) (is_valid_##name != 0)
@@ -34,8 +48,9 @@ static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
 static const bool kUseEnvBackground = USE_ENV_BACKGROUND;
-static const float3 kDefaultBackgroundColor = float3(0.25f, 0.25f, 0.25f);
+static const float3 kDefaultBackgroundColor = float3(0.f, 0.f, 0.f);
 static const float kRayTMax = FLT_MAX;
+static const bool kUseNee = USE_NEE;
 
 /**
  * Payload for shadow ray.
@@ -44,7 +59,6 @@ struct ShadowRayData
 {
     bool visible;
 };
-
 
 /**
  * Payload for scatter ray (up to 72B).
@@ -75,6 +89,29 @@ struct ScatterRayData
     }
 };
 
+/** Types of samplable lights.
+ */
+enum class LightType
+{
+    EnvMap,
+    Emissive,
+    Analytic
+};
+
+/** Describes a light sample.
+ */
+struct LightSample
+{
+    float3 Li;      ///< Incident radiance at the shading point (unshadowed). This is already divided by the pdf.
+    float pdf;      ///< Pdf with respect to solid angle at the shading point.
+    float3 origin;  ///< Ray origin for visibility evaluation (offseted to avoid self-intersection).
+    float distance; ///< Ray distance for visibility evaluation (shortened to avoid self-intersection).
+    float3 dir;     ///< Ray direction for visibility evaluation (normalized).
+    uint lightType; ///< Light type this sample comes from (LightType casted to uint).
+
+    Ray getVisibilityRay() { return Ray(origin, dir, 0.f, distance); }
+};
+
 /**
  * Helper to load G-buffer data and prepare shading data.
  */
@@ -91,6 +128,223 @@ ShadingData loadShadingData(const HitInfo hit, const float3 rayOrigin, const flo
     return sd;
 }
 
+/** Generates a light sample on the environment map.
+    \param[in] vertex Path vertex.
+    \param[in,out] sg Sample generator.
+    \param[out] ls Struct describing valid samples.
+    \return True if the sample is valid and has nonzero contribution, false otherwise.
+*/
+bool generateEnvMapSample(const ShadingData sd, inout SampleGenerator sg, out LightSample ls)
+{
+    ls = {}; // Default initialization to avoid divergence at returns.
+
+    if (!kUseEnvLight)
+        return false;
+
+    // Sample environment map.
+    EnvMapSample lightSample;
+    if (!gReSTIRData.envMapSampler.sample(sampleNext2D(sg), lightSample))
+        return false;
+
+    // Setup returned sample.
+    ls.Li = lightSample.pdf > 0.f ? lightSample.Le / lightSample.pdf : float3(0);
+    ls.pdf = lightSample.pdf;
+    ls.origin = computeRayOrigin(sd.posW, dot(sd.faceN, lightSample.dir) >= 0 ? sd.faceN : -sd.faceN);
+    ls.distance = kRayTMax;
+    ls.dir = lightSample.dir;
+
+    return any(ls.Li > 0.f);
+}
+
+/** Generates a light sample on the emissive geometry.
+    \param[in] vertex Path vertex.
+    \param[in] upperHemisphere True if only upper hemisphere should be considered.
+    \param[in,out] sg Sample generator.
+    \param[out] ls Struct describing valid samples.
+    \return True if the sample is valid and has nonzero contribution, false otherwise.
+*/
+bool generateEmissiveSample(const ShadingData sd, const bool upperHemisphere, inout SampleGenerator sg, out LightSample ls)
+{
+    ls = {}; // Default initialization to avoid divergence at returns.
+    if (!kUseEmissiveLights)
+        return false;
+
+    TriangleLightSample tls;
+    if (!gReSTIRData.emissiveSampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), upperHemisphere, sg, tls))
+        return false;
+
+    // Setup returned sample.
+    ls.Li = tls.pdf > 0.f ? tls.Le / tls.pdf : float3(0);
+    ls.pdf = tls.pdf;
+    // Offset shading and light position to avoid self-intersection.
+    float3 lightPos = computeRayOrigin(tls.posW, tls.normalW);
+    ls.origin = computeRayOrigin(sd.posW, dot(sd.faceN, lightPos - sd.posW) >= 0 ? sd.faceN : -sd.faceN);
+    float3 toLight = lightPos - ls.origin;
+    ls.distance = length(toLight);
+    ls.dir = normalize(toLight);
+
+    return any(ls.Li > 0.f);
+}
+
+/** Generates a light sample on the analytic lights.
+    \param[in] vertex Path vertex.
+    \param[in,out] sg Sample generator.
+    \param[out] ls Struct describing valid samples.
+    \return True if the sample is valid and has nonzero contribution, false otherwise.
+*/
+bool generateAnalyticLightSample(const ShadingData sd, inout SampleGenerator sg, out LightSample ls)
+{
+    ls = {}; // Default initialization to avoid divergence at returns.
+
+    uint lightCount = gScene.getLightCount();
+    if (!kUseAnalyticLights || lightCount == 0)
+        return false;
+
+    // Sample analytic light source selected uniformly from the light list.
+    // TODO: Sample based on estimated contributions as pdf.
+    uint lightIndex = min(uint(sampleNext1D(sg) * lightCount), lightCount - 1);
+
+    // Sample local light source.
+    AnalyticLightSample lightSample;
+    if (!sampleLight(sd.posW, gScene.getLight(lightIndex), sg, lightSample))
+        return false;
+
+    // Setup returned sample.
+    ls.pdf = lightSample.pdf / lightCount;
+    ls.Li = lightSample.Li * lightCount;
+    // Offset shading position to avoid self-intersection.
+    ls.origin = computeRayOrigin(sd.posW, dot(sd.faceN, lightSample.dir) >= 0 ? sd.faceN : -sd.faceN);
+    // Analytic lights do not currently have a geometric representation in the scene.
+    // Do not worry about adjusting the ray length to avoid self-intersections at the light.
+    ls.distance = lightSample.distance;
+    ls.dir = lightSample.dir;
+
+    return any(ls.Li > 0.f);
+}
+
+/** Return the probabilities for selecting different light types.
+    \param[out] p Probabilities.
+*/
+void getLightTypeSelectionProbabilities(out float p[3])
+{
+    // Set relative probabilities of the different sampling techniques.
+    // TODO: These should use estimated irradiance from each light type. Using equal probabilities for now.
+    p[0] = kUseEnvLight ? 1.f : 0.f;
+    p[1] = kUseEmissiveLights ? 1.f : 0.f;
+    p[2] = kUseAnalyticLights ? 1.f : 0.f;
+
+    // Normalize probabilities. Early out if zero.
+    float sum = p[0] + p[1] + p[2];
+    if (sum == 0.f)
+        return;
+
+    float invSum = 1.f / sum;
+    p[0] *= invSum;
+    p[1] *= invSum;
+    p[2] *= invSum;
+}
+
+float getEnvMapSelectionProbability()
+{
+    float p[3];
+    getLightTypeSelectionProbabilities(p);
+    return p[0];
+}
+float getEmissiveSelectionProbability()
+{
+    float p[3];
+    getLightTypeSelectionProbabilities(p);
+    return p[1];
+}
+float getAnalyicSelectionProbability()
+{
+    float p[3];
+    getLightTypeSelectionProbabilities(p);
+    return p[2];
+}
+
+/** Select a light type for sampling.
+    \param[out] lightType Selected light type.
+    \param[out] pdf Probability for selected type.
+    \param[in,out] sg Sample generator.
+    \return Return true if selection is valid.
+*/
+bool selectLightType(out uint lightType, out float pdf, inout SampleGenerator sg)
+{
+    float p[3];
+    getLightTypeSelectionProbabilities(p);
+
+    float u = sampleNext1D(sg);
+
+    [unroll] for (lightType = 0; lightType < 3; ++lightType)
+    {
+        if (u < p[lightType])
+        {
+            pdf = p[lightType];
+            return true;
+        }
+        u -= p[lightType];
+    }
+
+    lightType = {};
+    pdf = {};
+
+    return false;
+}
+
+/** Samples a light source in the scene.
+     This function first stochastically selects a type of light source to sample,
+     and then calls that the sampling function for the chosen light type.
+     \param[in] vertex Path vertex.
+     \param[in] sampleUpperHemisphere True if the upper hemisphere should be sampled.
+     \param[in] sampleLowerHemisphere True if the lower hemisphere should be sampled.
+     \param[in,out] sg Sample generator.
+     \param[out] ls Struct describing valid samples.
+     \return True if the sample is valid and has nonzero contribution, false otherwise.
+ */
+bool generateLightSample(
+    const ShadingData sd,
+    const bool sampleUpperHemisphere,
+    const bool sampleLowerHemisphere,
+    inout SampleGenerator sg,
+    out LightSample ls
+)
+{
+    ls = {};
+
+    uint lightType;
+    float selectionPdf;
+    if (!selectLightType(lightType, selectionPdf, sg))
+        return false;
+
+    bool valid = false;
+    if (kUseEnvLight && lightType == (uint)LightType::EnvMap)
+        valid = generateEnvMapSample(sd, sg, ls);
+    if (kUseEmissiveLights && lightType == (uint)LightType::Emissive)
+    {
+        // Emissive light samplers have an option to exclusively sample the upper hemisphere.
+        bool upperHemisphere = sampleUpperHemisphere && !sampleLowerHemisphere;
+        valid = generateEmissiveSample(sd, upperHemisphere, sg, ls);
+    }
+    if (kUseAnalyticLights && lightType == (uint)LightType::Analytic)
+    {
+        valid = generateAnalyticLightSample(sd, sg, ls);
+    }
+    if (!valid)
+        return false;
+
+    // Reject samples in non-requested hemispheres.
+    float NdotL = dot(sd.getOrientedFaceNormal(), ls.dir);
+    if ((!sampleUpperHemisphere && NdotL >= -kMinCosTheta) || (!sampleLowerHemisphere && NdotL <= kMinCosTheta))
+        return false;
+
+    // Account for light type selection.
+    ls.lightType = lightType;
+    ls.pdf *= selectionPdf;
+    ls.Li /= selectionPdf;
+
+    return true;
+}
 
 /**
  * Traces a shadow ray towards a light source.
@@ -139,7 +393,6 @@ void traceScatterRay(inout ScatterRayData rayData)
     TraceRay(gScene.rtAccel, rayFlags, 0xff /* instanceInclusionMask */, 0 /* hitIdx */, rayTypeCount, 0 /* missIdx */, ray, rayData);
 }
 
-
 /**
  * Evaluates the direct illumination from analytic lights.
  * This function samples Falcor's light list uniformly with one shadow ray.
@@ -183,6 +436,29 @@ float3 evalDirectAnalytic(const ShadingData sd, const IMaterialInstance mi, inou
     return mi.eval(sd, ls.dir, sg) * ls.Li * invPdf;
 }
 
+float3 evalNEE(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
+{
+    float3 outColor = 0.f;
+    LightSample ls = {};
+    uint lobeTypes = mi.getLobeTypes(sd);
+    bool sampleUpperHemisphere = (lobeTypes & (uint)LobeType::NonDeltaReflection) != 0;
+    bool sampleLowerHemisphere = (lobeTypes & (uint)LobeType::NonDeltaTransmission) != 0;
+    // Sample a light.
+    bool validSample = generateLightSample(sd, sampleUpperHemisphere, sampleLowerHemisphere, sg, ls);
+    float3 weight = mi.eval(sd, ls.dir, sg);
+    float3 Lr = weight * ls.Li;
+    if (any(Lr > 0.f))
+    {
+        bool V = traceShadowRay(ls.origin, ls.dir, ls.distance);
+        if (V)
+        {
+            outColor += Lr;
+        }
+    }
+
+    return outColor;
+}
+
 /**
  * Process a hit.
  * Loads the shading data, samples analytic lights and samples a new scatter ray.
@@ -201,7 +477,7 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     let mi = gScene.materials.getMaterialInstance(sd, lod);
 
     // Add emitted light.
-    if (kUseEmissiveLights && (kComputeDirect || rayData.pathLength > 0))
+    if (kUseEmissiveLights && !kUseNee && (kComputeDirect || rayData.pathLength > 0))
     {
         rayData.radiance += rayData.thp * mi.getProperties(sd).emission;
     }
@@ -211,6 +487,11 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     {
         rayData.terminated = true;
         return;
+    }
+
+    if (kUseNee)
+    {
+        rayData.radiance += rayData.thp * evalNEE(sd, mi, rayData.sg);
     }
 
     // Compute ray origin for new rays spawned from the hit.
@@ -258,8 +539,7 @@ bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3
 // Shader entry points for miss shaders.
 //
 
-[shader("miss")]
-void scatterMiss(inout ScatterRayData rayData)
+[shader("miss")] void scatterMiss(inout ScatterRayData rayData)
 {
     // Ray missed the scene. Mark the ray as terminated.
     rayData.terminated = true;
@@ -272,8 +552,7 @@ void scatterMiss(inout ScatterRayData rayData)
     }
 }
 
-[shader("anyhit")]
-void scatterAnyHit(inout ScatterRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
+    [shader("anyhit")] void scatterAnyHit(inout ScatterRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
 {
     // Alpha test for non-opaque geometry.
     GeometryInstanceID instanceID = getGeometryInstanceID();
@@ -283,8 +562,7 @@ void scatterAnyHit(inout ScatterRayData rayData, BuiltInTriangleIntersectionAttr
         IgnoreHit();
 }
 
-[shader("closesthit")]
-void scatterClosestHit(inout ScatterRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
+[shader("closesthit")] void scatterClosestHit(inout ScatterRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
 {
     TriangleHit triangleHit;
     triangleHit.instanceID = getGeometryInstanceID();
@@ -293,17 +571,15 @@ void scatterClosestHit(inout ScatterRayData rayData, BuiltInTriangleIntersection
     handleHit(HitInfo(triangleHit), rayData);
 }
 
-/************************** Ray index 1: Shadow ray ************************ */
+    /************************** Ray index 1: Shadow ray ************************ */
 
-[shader("miss")]
-void shadowMiss(inout ShadowRayData rayData)
+    [shader("miss")] void shadowMiss(inout ShadowRayData rayData)
 {
     // The miss shader is executed if the ray misses all geometry. Mark as visible.
     rayData.visible = true;
 }
 
-[shader("anyhit")]
-void shadowAnyHit(inout ShadowRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
+[shader("anyhit")] void shadowAnyHit(inout ShadowRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
 {
     // Alpha test for non-opaque geometry.
     GeometryInstanceID instanceID = getGeometryInstanceID();
@@ -333,7 +609,6 @@ float3 getPrimaryRayDir(uint2 launchIndex, uint2 launchDim, const Camera camera)
         return camera.computeRayPinhole(launchIndex, launchDim).dir;
     }
 }
-
 
 float3 tracePath(const uint2 pixel, const uint2 frameDim)
 {
@@ -368,9 +643,16 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             // Always output directly emitted light, independent of whether emissive materials are treated as light sources or not.
             outColor += mi.getProperties(sd).emission;
 
-            // Add contribution of direct light from analytic lights.
-            // Light probe and mesh lights are handled by the scatter ray hit/miss shaders.
-            outColor += kUseAnalyticLights ? evalDirectAnalytic(sd, mi, sg) : float3(0.f);
+            if (kUseNee)
+            {
+                outColor += evalNEE(sd, mi, sg);
+            }
+            else
+            {
+                // Add contribution of direct light from analytic lights.
+                // Light probe and mesh lights are handled by the scatter ray hit/miss shaders.
+                outColor += kUseAnalyticLights ? evalDirectAnalytic(sd, mi, sg) : float3(0.f);
+            }
         }
 
         // Prepare ray payload.
@@ -400,8 +682,7 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
     return outColor;
 }
 
-[shader("raygeneration")]
-void rayGen()
+[shader("raygeneration")] void rayGen()
 {
     uint2 pixel = DispatchRaysIndex().xy;
     uint2 frameDim = DispatchRaysDimensions().xy;

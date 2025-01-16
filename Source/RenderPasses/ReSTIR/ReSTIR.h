@@ -30,6 +30,8 @@
 #include "RenderGraph/RenderPass.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "Utils/Sampling/SampleGenerator.h"
+#include "Rendering/Lights/EmissivePowerSampler.h"
+#include "Rendering/Lights/EnvMapSampler.h"
 #include "Rendering/Materials/TexLODTypes.slang" // Using the enum with Mip0, RayCones, etc
 
 using namespace Falcor;
@@ -64,6 +66,14 @@ private:
     ref<SampleGenerator>            mpSampleGenerator;
     bool                            mRecompile = false;
 
+    std::unique_ptr<EnvMapSampler>  mpEnvMapSampler = nullptr;            ///< Environment map sampler or nullptr if not used.
+    std::unique_ptr<EmissiveLightSampler> mpEmissiveSampler  = nullptr;    ///< Emissive light sampler or nullptr if not used.
+
+    ref<ParameterBlock>             mpReSTIRDataBlock;
+
+    sigs::Connection                mUpdateFlagsConnection; ///< Connection to the UpdateFlags signal.
+    IScene::UpdateFlags             mUpdateFlags = IScene::UpdateFlags::None;
+
         // Ray tracing program.
     struct
     {
@@ -81,4 +91,6 @@ private:
     uint mMaxBounces = 3;
     /// Compute direct illumination (otherwise indirect only).
     bool mComputeDirect = true;
+
+    bool mUseNee = true;
 };
