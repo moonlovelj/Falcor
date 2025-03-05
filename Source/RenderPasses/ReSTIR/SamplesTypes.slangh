@@ -1,0 +1,29 @@
+#include "Utils/Math/MathConstants.slangh"
+#include "Utils/HostDeviceShared.slangh"
+#include "Scene/SceneDefines.slangh"
+
+
+/** Describes a light sample.
+ */
+struct LightSample
+{
+    float3 Li;      ///< Incident radiance at the shading point (unshadowed). This is already divided by the pdf.
+    float pdf;      ///< Pdf with respect to solid angle at the shading point.
+    float3 origin;  ///< Ray origin for visibility evaluation (offseted to avoid self-intersection).
+    float distance; ///< Ray distance for visibility evaluation (shortened to avoid self-intersection).
+    float3 dir;     ///< Ray direction for visibility evaluation (normalized).
+    uint lightType; ///< Light type this sample comes from (LightType casted to uint).
+
+    Ray getVisibilityRay() { return Ray(origin, dir, 0.f, distance); }
+};
+
+struct ReSTIRSample
+{
+    LightSample lightSample;
+    /* data */
+    float W = 0;
+
+    bool isValid = false;
+};
+
+

@@ -33,6 +33,9 @@
 #include "Rendering/Lights/EmissivePowerSampler.h"
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Rendering/Materials/TexLODTypes.slang" // Using the enum with Mip0, RayCones, etc
+#include "Core/API/Buffer.h"
+#include "Core/Pass/ComputePass.h"
+
 
 using namespace Falcor;
 
@@ -58,8 +61,10 @@ public:
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
 
 private:
+    void prepareSamplesVars();
     void prepareVars();
     void setStaticParams(Program* pProgram) const;
+    void generateSamples(RenderContext* pRenderContext, const RenderData& renderData);
 
     ref<Scene>                      mpScene;
      /// GPU sample generator.
@@ -74,6 +79,10 @@ private:
     sigs::Connection                mUpdateFlagsConnection; ///< Connection to the UpdateFlags signal.
     IScene::UpdateFlags             mUpdateFlags = IScene::UpdateFlags::None;
 
+    ref<ComputePass>                mpGenerateSamples;
+    ref<Buffer>                     mpSamplesBuffer;
+    // ref<Texture>                    mpSamplesTexture;
+
         // Ray tracing program.
     struct
     {
@@ -81,6 +90,15 @@ private:
         ref<RtBindingTable> pBindingTable;
         ref<RtProgramVars> pVars;
     } mTracer;
+
+    struct
+    {
+        ref<Program> pProgram;
+        ref<RtBindingTable> pBindingTable;
+        ref<RtProgramVars> pVars;
+    } mSamplesTracer;
+
+    uint2 mScreenDim = uint2(0, 0);
 
     // Frame count since scene was loaded.
     uint mFrameCount = 0;
@@ -93,4 +111,6 @@ private:
     bool mComputeDirect = true;
 
     bool mUseNee = true;
+
+    uint mCandidateNum = 8;
 };
