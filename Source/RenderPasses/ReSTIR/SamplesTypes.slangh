@@ -13,8 +13,8 @@ struct LightSample
     float distance; ///< Ray distance for visibility evaluation (shortened to avoid self-intersection).
     float3 dir;     ///< Ray direction for visibility evaluation (normalized).
     uint lightType; ///< Light type this sample comes from (LightType casted to uint).
-
-    Ray getVisibilityRay() { return Ray(origin, dir, 0.f, distance); }
+    float G;        ///< Geometric term for the sample, i.e. the cosine term and the distance squared term.
+    // float3 pad;
 };
 
 struct ReSTIRSample
@@ -22,8 +22,8 @@ struct ReSTIRSample
     LightSample lightSample;
     /* data */
     float W = 0;
-
     bool isValid = false;
+    // float2 pad;
 };
 
 

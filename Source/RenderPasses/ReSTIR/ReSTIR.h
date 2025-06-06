@@ -112,5 +112,5 @@ private:
 
     bool mUseNee = true;
 
-    uint mCandidateNum = 8;
+    uint mCandidateNum = 1;
 };
