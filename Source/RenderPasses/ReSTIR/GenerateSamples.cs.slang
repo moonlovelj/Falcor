@@ -25,7 +25,7 @@ static const bool kComputeDirect = COMPUTE_DIRECT;
 static const float kRayTMax = FLT_MAX;
 static const uint kCandidateNum = CANDIDATE_NUM;
 
-static const float kMinPdf = 1e-6f;
+static const float kSmallNumber = 1e-6f;
 
 cbuffer CB
 {
@@ -39,6 +39,10 @@ Texture2D<float4> gViewW; // Optional
 
 
 RWStructuredBuffer<ReSTIRSample> gOutputSamples;
+
+RWTexture2D<float4> gWY;
+RWTexture2D<float4> gwsum;
+RWTexture2D<float4> gphat;
 
 
 struct ReSTIRData
@@ -363,7 +367,6 @@ void InitReservoir(inout Reservoir r)
 
     r.outputSample.isValid = false;
     r.outputSample.W = 0;
-    // r.outputSample.pad = 0;
 
     r.outputSample.lightSample.Li = 0;
     r.outputSample.lightSample.pdf = 0;
@@ -372,26 +375,15 @@ void InitReservoir(inout Reservoir r)
     r.outputSample.lightSample.dir = 0;
     r.outputSample.lightSample.lightType = 0;
     r.outputSample.lightSample.G = 0;
-    // r.outputSample.lightSample.pad = 0;
 }
 
 void UpdateReservoir(inout Reservoir r, in ReSTIRSample inSample, float weight, inout SampleGenerator sg)
 {
     r.weightSum += weight;
     r.M += 1;
-    if (r.weightSum > kMinPdf && sampleNext1D(sg) < weight / r.weightSum)
+    if (r.weightSum > kSmallNumber && sampleNext1D(sg) < weight / r.weightSum)
     {
         r.outputSample = inSample;
-        // r.outputSample.lightSample.Li = inSample.lightSample.Li;
-        // r.outputSample.lightSample.pdf = inSample.lightSample.pdf;
-        // r.outputSample.lightSample.origin = inSample.lightSample.origin;
-        // r.outputSample.lightSample.distance = inSample.lightSample.distance;
-        // r.outputSample.lightSample.dir = inSample.lightSample.dir;
-        // r.outputSample.lightSample.lightType = inSample.lightSample.lightType;
-        // r.outputSample.lightSample.G = inSample.lightSample.G;
-
-        // r.outputSample.W = inSample.W;
-        // r.outputSample.isValid = inSample.isValid;
     }
 }
 
@@ -456,6 +448,12 @@ bool traceShadowRay(float3 origin, float3 dir, float distance)
     const float3 primaryRayDir = getPrimaryRayDir(pixel, frameDim, gScene.camera);
     const HitInfo hit = HitInfo(gVBuffer[pixel]);
 
+    Reservoir r;
+    InitReservoir(r);
+    float W_Y = 0;
+    float w_sum = 0;
+    float Y_p_hat = 0;
+
     if (hit.isValid())
     {
         const float3 primaryRayOrigin = gScene.camera.getPosition();
@@ -486,8 +484,6 @@ bool traceShadowRay(float3 origin, float3 dir, float distance)
         // 因此w_i = (1/M)*p_hat/p_Xi
         if (kComputeDirect)
         {
-            Reservoir r;
-            InitReservoir(r);
             for (uint i = 0; i < kCandidateNum; i++)
             {
                 ReSTIRSample sample = GenerateSample(sd, mi, sg);
@@ -496,22 +492,29 @@ bool traceShadowRay(float3 origin, float3 dir, float distance)
                 float p_hat = luminance(mi.eval(sd, sample.lightSample.dir, sg)) * luminance(sample.lightSample.Li) * V; // G项约掉了
                 float p_Xi = sample.lightSample.pdf;                                                                     // 立体角pdf
                 float w_i = 0;
-                if (p_Xi > kMinPdf)
+                if (p_Xi > kSmallNumber)
                 {
                     w_i = 1.0 / kCandidateNum * p_hat / p_Xi;
                 }
 
                 UpdateReservoir(r, sample, w_i, sg);
             }
+
             if (r.outputSample.isValid)
             {
                 const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.outputSample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
                 float V = (float)traceShadowRay(origin, r.outputSample.lightSample.dir, r.outputSample.lightSample.distance);
                 float p_hat = luminance(mi.eval(sd, r.outputSample.lightSample.dir, sg)) * luminance(r.outputSample.lightSample.Li) * r.outputSample.lightSample.G * V;
-                if (p_hat > kMinPdf)
+                if (p_hat > kSmallNumber)
                 {
                     r.outputSample.W = r.weightSum / p_hat;
                 }
+
+                // debug
+                W_Y = r.outputSample.W;
+                Y_p_hat = p_hat;
+                w_sum = r.weightSum;
+                //
             }
 
             gOutputSamples[pixel.x + pixel.y * frameDim.x] = r.outputSample;
@@ -519,6 +522,10 @@ bool traceShadowRay(float3 origin, float3 dir, float distance)
     }
     else
     {
-        gOutputSamples[pixel.x + pixel.y * frameDim.x].isValid = false;
+        gOutputSamples[pixel.x + pixel.y * frameDim.x] = r.outputSample;
     }
+
+    gWY[pixel] = float4(float3(W_Y), 1);
+    gphat[pixel] = float4(float3(Y_p_hat), 1);
+    gwsum[pixel] = float4(float3(w_sum), 1);
 }

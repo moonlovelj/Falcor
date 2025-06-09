@@ -46,7 +46,7 @@ const uint32_t kMaxRecursionDepth = 2u;
 const ChannelList kOutputChannels = {
     // clang-format off
         { "color",          "gOutputColor",                "Output color (sum of direct and indirect)", false, ResourceFormat::RGBA32Float },
-        { "weight",          "gOutputWeight",                "Output weight (sum of direct and indirect)", false, ResourceFormat::RGBA32Float },
+        { "weight",         "gOutputWeight",                "Output weight (sum of direct and indirect)", false, ResourceFormat::RGBA32Float },
     // clang-format on
 };
 
@@ -59,7 +59,9 @@ const ChannelList kInputChannels = {
 
 const ChannelList kSamplesOutputChannels = {
     // clang-format off
-        // { "color",          "gOutputColor",                "Output color (sum of direct and indirect)", false, ResourceFormat::R32Float },
+        { "WY",           "gWY",                      "WY", false, ResourceFormat::RGBA32Float },
+        { "wsum",         "gwsum",                    "wsum", false, ResourceFormat::RGBA32Float },
+        { "phat",         "gphat",                    "phat", false, ResourceFormat::RGBA32Float }
     // clang-format on
 };
 
@@ -102,6 +104,7 @@ RenderPassReflection ReSTIR::reflect(const CompileData& compileData)
 
     addRenderPassInputs(reflector, kInputChannels);
     addRenderPassOutputs(reflector, kOutputChannels);
+    addRenderPassOutputs(reflector, kSamplesOutputChannels);
 
     return reflector;
 }
@@ -191,6 +194,8 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
     {
         mpEmissiveSampler->update(pRenderContext, mpScene->getLightCollection(pRenderContext));
         auto defines = mpEmissiveSampler->getDefines();
+        if (mSamplesTracer.pProgram->addDefines(defines))
+            mRecompile = true;
         if (mTracer.pProgram->addDefines(defines))
             mRecompile = true;
     }
