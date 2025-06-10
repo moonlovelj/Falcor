@@ -59,9 +59,10 @@ const ChannelList kInputChannels = {
 
 const ChannelList kSamplesOutputChannels = {
     // clang-format off
-        { "WY",           "gWY",                      "WY", false, ResourceFormat::RGBA32Float },
-        { "wsum",         "gwsum",                    "wsum", false, ResourceFormat::RGBA32Float },
-        { "phat",         "gphat",                    "phat", false, ResourceFormat::RGBA32Float }
+        { "WY",           "gWY",                                    "WY", false, ResourceFormat::RGBA32Float },
+        { "wsum",         "gwsum",                                  "wsum", false, ResourceFormat::RGBA32Float },
+        { "phat",         "gphat",                                  "phat", false, ResourceFormat::RGBA32Float },
+        { "ReSTIRColor",  "gOutputColor",                           "ReSTIRColor", false, ResourceFormat::RGBA32Float }
     // clang-format on
 };
 
@@ -295,6 +296,9 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
 
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 1u << 16);
     widget.tooltip("Maximum path length for indirect illumination.\n0 = direct only\n1 = one indirect bounce etc.", true);
+
+    dirty |= widget.var("Candidate Num", mCandidateNum, 1u, 256u);
+    widget.tooltip("Candidate Num of ReSTIR.", true);
 
     dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
     widget.tooltip("Compute direct illumination.\nIf disabled only indirect is computed (when max bounces > 0).", true);
