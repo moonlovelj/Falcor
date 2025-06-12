@@ -1,7 +1,6 @@
 #include "Utils/Math/MathConstants.slangh"
 #include "Utils/HostDeviceShared.slangh"
 #include "Scene/SceneDefines.slangh"
-#include "SamplesTypes.slangh"
 
 import Scene.Raytracing;
 import Scene.Intersection;
@@ -28,11 +27,8 @@ cbuffer CB
 Texture2D<PackedHitInfo> gVBuffer;
 Texture2D<float4> gViewW; // Optional
 
-StructuredBuffer<ReSTIRSample> gSamples;
-
 // Outputs
 RWTexture2D<float4> gOutputColor;
-RWTexture2D<float4> gOutputWeight;
 
 struct ReSTIRData
 {
@@ -55,6 +51,18 @@ static const bool kUseEnvBackground = USE_ENV_BACKGROUND;
 static const float3 kDefaultBackgroundColor = float3(0.f, 0.f, 0.f);
 static const float kRayTMax = FLT_MAX;
 static const bool kUseNee = USE_NEE;
+
+/** Describes a light sample.
+ */
+struct LightSample
+{
+    float3 Li;      ///< Incident radiance at the shading point (unshadowed). This is already divided by the pdf.
+    float pdf;      ///< Pdf with respect to solid angle at the shading point.
+    float3 origin;  ///< Ray origin for visibility evaluation (offseted to avoid self-intersection).
+    float distance; ///< Ray distance for visibility evaluation (shortened to avoid self-intersection).
+    float3 dir;     ///< Ray direction for visibility evaluation (normalized).
+    uint lightType; ///< Light type this sample comes from (LightType casted to uint).
+};
 
 /**
  * Payload for shadow ray.
@@ -694,6 +702,4 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
     float3 color = tracePath(pixel, frameDim);
 
     gOutputColor[pixel] = float4(color, 1.f);
-
-    gOutputWeight[pixel] = float4(float3(gSamples[pixel.x + pixel.y * frameDim.x].W), 1);
 }

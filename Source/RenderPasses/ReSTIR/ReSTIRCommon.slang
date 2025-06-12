@@ -1,7 +1,7 @@
 #include "Utils/Math/MathConstants.slangh"
 #include "Utils/HostDeviceShared.slangh"
 #include "Scene/SceneDefines.slangh"
-#include "SamplesTypes.slangh"
+#include "ReSTIRStructs.slangh"
 
 import Scene.Raytracing;
 import Scene.Intersection;
@@ -18,16 +18,20 @@ import Rendering.Lights.EmissiveLightSampler;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 
 #define is_valid(name) (is_valid_##name != 0)
+
 static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
 static const bool kComputeDirect = COMPUTE_DIRECT;
 static const float kRayTMax = FLT_MAX;
 static const uint kCandidateNum = CANDIDATE_NUM;
+static const uint kCCap = C_CAP;
 static const bool kUseEnvBackground = USE_ENV_BACKGROUND;
 
 static const float3 kDefaultBackgroundColor = float3(0.f, 0.f, 0.f);
-static const float kSmallNumber = 1e-6f;
+
+Texture2D<PackedHitInfo> gVBuffer;
+Texture2D<float4> gViewW; // Optional
 
 cbuffer CB
 {
@@ -35,16 +39,6 @@ cbuffer CB
     uint gPRNGDimension; // First available PRNG dimension.
     uint2 gOutputDim;
 }
-
-Texture2D<PackedHitInfo> gVBuffer;
-Texture2D<float4> gViewW; // Optional
-
-RWStructuredBuffer<ReSTIRSample> gOutputSamples;
-RWTexture2D<float4> gOutputColor;
-RWTexture2D<float4> gWY;
-RWTexture2D<float4> gwsum;
-RWTexture2D<float4> gphat;
-
 
 struct ReSTIRData
 {
@@ -57,11 +51,21 @@ ParameterBlock<ReSTIRData> gReSTIRData;
 
 /** Types of samplable lights.
  */
-enum class LightType
+enum class SceneLightType : uint32_t
 {
     EnvMap,
     Emissive,
     Analytic
+};
+
+enum class AnalyticLightType : uint32_t
+{
+    Point,       ///< Point light source, can be a spot light if its opening angle is < 2pi
+    Directional, ///< Directional light source
+    Distant,     ///< Distant light that subtends a non-zero solid angle
+    Rect,        ///< Quad shaped area light source
+    Disc,        ///< Disc shaped area light source
+    Sphere,      ///< Spherical area light source
 };
 
 /**
@@ -71,7 +75,6 @@ struct ShadowRayData
 {
     bool visible;
 };
-
 
 /**
  * Helper to load G-buffer data and prepare shading data.
@@ -113,7 +116,8 @@ bool generateEnvMapSample(const ShadingData sd, inout SampleGenerator sg, out Li
     ls.origin = computeRayOrigin(sd.posW, dot(sd.faceN, lightSample.dir) >= 0 ? sd.faceN : -sd.faceN);
     ls.distance = kRayTMax;
     ls.dir = lightSample.dir;
-    ls.G = 1;
+    ls.posW = float3(0.f);
+    ls.normalW = float3(0.f);
 
     return any(ls.Li > 0.f);
 }
@@ -135,6 +139,8 @@ bool generateEmissiveSample(const ShadingData sd, const bool upperHemisphere, in
     if (!gReSTIRData.emissiveSampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), upperHemisphere, sg, tls))
         return false;
 
+    float G = max(0.f, dot(tls.normalW, -tls.dir) / max(FLT_MIN, tls.distance * tls.distance)); // Cosine term and distance squared term.
+    tls.pdf *= G;// 从pdf中去掉几何项
     // Setup returned sample.
     ls.Li = tls.pdf > 0.f ? tls.Le / tls.pdf : float3(0);
     ls.pdf = tls.pdf;
@@ -144,7 +150,9 @@ bool generateEmissiveSample(const ShadingData sd, const bool upperHemisphere, in
     float3 toLight = lightPos - ls.origin;
     ls.distance = length(toLight);
     ls.dir = normalize(toLight);
-    ls.G = max(FLT_MIN, dot(tls.normalW, -tls.dir) / max(FLT_MIN, tls.distance * tls.distance)); // Cosine term and distance squared term.
+
+    ls.posW = tls.posW;
+    ls.normalW = tls.normalW;
 
     return any(ls.Li > 0.f);
 }
@@ -169,7 +177,8 @@ bool generateAnalyticLightSample(const ShadingData sd, inout SampleGenerator sg,
 
     // Sample local light source.
     AnalyticLightSample lightSample;
-    if (!sampleLight(sd.posW, gScene.getLight(lightIndex), sg, lightSample))
+    const LightData lightData = gScene.getLight(lightIndex);
+    if (!sampleLight(sd.posW, lightData, sg, lightSample))
         return false;
 
     // Setup returned sample.
@@ -181,7 +190,18 @@ bool generateAnalyticLightSample(const ShadingData sd, inout SampleGenerator sg,
     // Do not worry about adjusting the ray length to avoid self-intersections at the light.
     ls.distance = lightSample.distance;
     ls.dir = lightSample.dir;
-    ls.G = max(FLT_MIN, dot(lightSample.normalW, -lightSample.dir) / max(FLT_MIN, lightSample.distance * lightSample.distance)); // Cosine term and distance squared term.
+
+    ls.posW = lightSample.posW;
+    ls.normalW = lightSample.normalW;
+    ls.LightSubType = lightData.type;
+
+    if (lightData.type != uint(AnalyticLightType::Point) && lightData.type != uint(AnalyticLightType::Directional) && lightData.type != uint(AnalyticLightType::Distant))
+    {
+        // TODO 聚光灯Cone衰减没有处理呢，先放置
+        // 以及Li中的几何项以及衰减项也需要去掉，不然采样点复用的时候就不对了，也先不处理
+        float G = max(0.f, dot(lightSample.normalW, -lightSample.dir) / max(FLT_MIN, lightSample.distance * lightSample.distance)); // Cosine term and distance squared term.
+        ls.pdf *= G;
+    }
 
     return any(ls.Li > 0.f);
 }
@@ -282,15 +302,15 @@ bool generateLightSample(
         return false;
 
     bool valid = false;
-    if (kUseEnvLight && lightType == (uint)LightType::EnvMap)
+    if (kUseEnvLight && lightType == (uint)SceneLightType::EnvMap)
         valid = generateEnvMapSample(sd, sg, ls);
-    if (kUseEmissiveLights && lightType == (uint)LightType::Emissive)
+    if (kUseEmissiveLights && lightType == (uint)SceneLightType::Emissive)
     {
         // Emissive light samplers have an option to exclusively sample the upper hemisphere.
         bool upperHemisphere = sampleUpperHemisphere && !sampleLowerHemisphere;
         valid = generateEmissiveSample(sd, upperHemisphere, sg, ls);
     }
-    if (kUseAnalyticLights && lightType == (uint)LightType::Analytic)
+    if (kUseAnalyticLights && lightType == (uint)SceneLightType::Analytic)
     {
         valid = generateAnalyticLightSample(sd, sg, ls);
     }
@@ -303,7 +323,7 @@ bool generateLightSample(
         return false;
 
     // Account for light type selection.
-    ls.lightType = lightType;
+    ls.LightType = lightType;
     ls.pdf *= selectionPdf;
     ls.Li /= selectionPdf;
 
@@ -327,86 +347,6 @@ float3 getPrimaryRayDir(uint2 launchIndex, uint2 launchDim, const Camera camera)
         // sample generator between the passes, which is error prone. The host side will issue a warning instead.
         return camera.computeRayPinhole(launchIndex, launchDim).dir;
     }
-}
-
-ReSTIRSample GenerateSample(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
-{
-    ReSTIRSample Sample;
-
-    float3 outColor = 0.f;
-    LightSample ls = {};
-    uint lobeTypes = mi.getLobeTypes(sd);
-    bool sampleUpperHemisphere = (lobeTypes & (uint)LobeType::NonDeltaReflection) != 0;
-    bool sampleLowerHemisphere = (lobeTypes & (uint)LobeType::NonDeltaTransmission) != 0;
-    // Sample a light.
-    bool validSample = generateLightSample(sd, sampleUpperHemisphere, sampleLowerHemisphere, sg, ls);
-    if (validSample)
-    {
-        Sample.isValid = true;
-        Sample.lightSample = ls;
-    }
-    else
-    {
-        Sample.isValid = false;
-    }
-
-    return Sample;
-}
-
-struct Reservoir
-{
-    /* data */
-    ReSTIRSample outputSample;
-    float weightSum = 0;
-    uint M = 0;
-};
-
-void InitReservoir(inout Reservoir r)
-{
-    r.weightSum = 0;
-    r.M = 0;
-
-    r.outputSample.isValid = false;
-    r.outputSample.W = 0;
-
-    r.outputSample.lightSample.Li = 0;
-    r.outputSample.lightSample.pdf = 0;
-    r.outputSample.lightSample.origin = 0;
-    r.outputSample.lightSample.distance = 0;
-    r.outputSample.lightSample.dir = 0;
-    r.outputSample.lightSample.lightType = 0;
-    r.outputSample.lightSample.G = 0;
-}
-
-void UpdateReservoir(inout Reservoir r, in ReSTIRSample inSample, float weight, inout SampleGenerator sg)
-{
-    r.weightSum += weight;
-    r.M += 1;
-    if (r.weightSum > 0.f && sampleNext1D(sg) < weight / r.weightSum)
-    {
-        r.outputSample = inSample;
-    }
-}
-
-float luminance(float3 color)
-{
-    return dot(color, float3(0.299, 0.587, 0.114));
-}
-
-[shader("miss")] void shadowMiss(inout ShadowRayData rayData)
-{
-    // The miss shader is executed if the ray misses all geometry. Mark as visible.
-    rayData.visible = true;
-}
-
-[shader("anyhit")] void shadowAnyHit(inout ShadowRayData rayData, BuiltInTriangleIntersectionAttributes attribs)
-{
-    // Alpha test for non-opaque geometry.
-    GeometryInstanceID instanceID = getGeometryInstanceID();
-    VertexData v = getVertexData(instanceID, PrimitiveIndex(), attribs);
-    const uint materialID = gScene.getMaterialID(instanceID);
-    if (gScene.materials.alphaTest(v, materialID, 0.f))
-        IgnoreHit();
 }
 
 /**
@@ -440,91 +380,44 @@ bool traceShadowRay(float3 origin, float3 dir, float distance)
     return rayData.visible;
 }
 
-[shader("raygeneration")] void rayGen()
+float luminance(float3 color)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    return dot(color, float3(0.299, 0.587, 0.114));
+}
 
-    const float3 primaryRayOrigin = gScene.camera.getPosition();
-    const float3 primaryRayDir = getPrimaryRayDir(pixel, frameDim, gScene.camera);
-    const HitInfo hit = HitInfo(gVBuffer[pixel]);
+float evalLightSampleG(const LightSample ls, const ShadingData sd)
+{
+    // Compute the geometric term G.
+    float3 toLight = ls.posW - sd.posW;
+    float distSqr = max(FLT_MIN, dot(toLight, toLight));
+    float G = max(0.f, dot(ls.normalW, -normalize(toLight)) / distSqr);
+    return G;
+}
 
-    float3 outColor = float3(0.f);
+void InitReservoir(inout Reservoir r)
+{
+    r.weightSum = 0;
+    r.M = 0;
 
-    Reservoir r;
-    InitReservoir(r);
-    float W_Y = 0;
-    float w_sum = 0;
-    float Y_p_hat = 0;
+    r.outputSample.isValid = false;
+    r.outputSample.W = 0;
 
-    if (hit.isValid())
+    r.outputSample.lightSample.Li = 0;
+    r.outputSample.lightSample.pdf = 0;
+    r.outputSample.lightSample.origin = 0;
+    r.outputSample.lightSample.distance = 0;
+    r.outputSample.lightSample.dir = 0;
+    r.outputSample.lightSample.LightType = 0;
+    r.outputSample.lightSample.LightSubType = 0;
+}
+
+void UpdateReservoir(inout Reservoir r, in ReSTIRSample inSample, float weight, inout SampleGenerator sg, uint c)
+{
+    r.M += c;
+    r.M = min(r.M, kCCap);
+    r.weightSum += weight;
+    if (r.weightSum > 0.f && sampleNext1D(sg) < weight / r.weightSum)
     {
-        // Load shading data.
-        ShadingData sd = loadShadingData(hit, primaryRayOrigin, primaryRayDir);
-
-        // Create material instance at shading point.
-        let lod = ExplicitLodTextureSampler(0.f);
-        let mi = gScene.materials.getMaterialInstance(sd, lod);
-
-        // Create sample generator.
-        SampleGenerator sg = SampleGenerator(pixel, gFrameCount);
-
-        // Advance the generator to the first available dimension.
-        // TODO: This is potentially expensive. We may want to store/restore the state from memory if it becomes a problem.
-        for (uint i = 0; i < gPRNGDimension; i++)
-            sampleNext1D(sg);
-
-
-        gOutputSamples[pixel.x + pixel.y * frameDim.x].isValid = false;
-        // 目标函数 p _hat  = f * L * G * V
-        // m_i = 1 / M
-        // p_Xi = 光源采样pdf
-        // W_Xi = 1 / p_Xi
-        // w_i = m_i * p_hat * W_Xi
-        // 因此w_i = (1/M)*p_hat/p_Xi
-        if (kComputeDirect)
-        {
-            for (uint i = 0; i < kCandidateNum; i++)
-            {
-                ReSTIRSample sample = GenerateSample(sd, mi, sg);
-                const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, sample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
-                float V = (float)traceShadowRay(origin, sample.lightSample.dir, sample.lightSample.distance);
-                float p_hat = luminance(mi.eval(sd, sample.lightSample.dir, sg)) * luminance(sample.lightSample.Li) * V; // G和pdf包含在Li中了
-                float w_i = 1.0 / kCandidateNum * p_hat;
-                UpdateReservoir(r, sample, w_i, sg);
-            }
-
-            if (r.outputSample.isValid)
-            {
-                const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.outputSample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
-                float V = (float)traceShadowRay(origin, r.outputSample.lightSample.dir, r.outputSample.lightSample.distance);
-                float p_hat = luminance(mi.eval(sd, r.outputSample.lightSample.dir, sg)) * luminance(r.outputSample.lightSample.Li * r.outputSample.lightSample.pdf) * r.outputSample.lightSample.G * V;
-                r.outputSample.W = r.weightSum / max(FLT_MIN, p_hat);
-
-                // debug
-                W_Y = r.outputSample.W;
-                Y_p_hat = p_hat;
-                w_sum = r.weightSum;
-                //
-
-                outColor = (mi.eval(sd, r.outputSample.lightSample.dir, sg)) * (r.outputSample.lightSample.Li * r.outputSample.lightSample.pdf) * r.outputSample.lightSample.G * V * r.outputSample.W;
-            }
-
-            outColor += mi.getProperties(sd).emission;
-
-            gOutputSamples[pixel.x + pixel.y * frameDim.x] = r.outputSample;
-        }
+        r.outputSample = inSample;
     }
-    else
-    {
-        gOutputSamples[pixel.x + pixel.y * frameDim.x] = r.outputSample;
-
-        // Background pixel.
-        outColor = kUseEnvBackground ? gScene.envMap.eval(primaryRayDir) : kDefaultBackgroundColor;
-    }
-
-    gWY[pixel] = float4(float3(W_Y), 1);
-    gphat[pixel] = float4(float3(Y_p_hat), 1);
-    gwsum[pixel] = float4(float3(w_sum), 1);
-    gOutputColor[pixel] = float4(outColor, 1.0f);
 }

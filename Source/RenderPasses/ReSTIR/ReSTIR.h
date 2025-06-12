@@ -62,6 +62,7 @@ public:
 
 private:
     void prepareSamplesVars();
+    void prepareShadingVars();
     void prepareVars();
     void setStaticParams(Program* pProgram) const;
     void generateSamples(RenderContext* pRenderContext, const RenderData& renderData);
@@ -98,6 +99,13 @@ private:
         ref<RtProgramVars> pVars;
     } mSamplesTracer;
 
+    struct
+    {
+        ref<Program> pProgram;
+        ref<RtBindingTable> pBindingTable;
+        ref<RtProgramVars> pVars;
+    } mShadingTracer;
+
     uint2 mScreenDim = uint2(0, 0);
 
     // Frame count since scene was loaded.
@@ -113,4 +121,5 @@ private:
     bool mUseNee = true;
 
     uint mCandidateNum = 1;
+    uint mCCap = 20; // 置信度上限
 };

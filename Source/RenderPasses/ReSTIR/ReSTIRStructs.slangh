@@ -1,20 +1,16 @@
-#include "Utils/Math/MathConstants.slangh"
-#include "Utils/HostDeviceShared.slangh"
-#include "Scene/SceneDefines.slangh"
-
-
 /** Describes a light sample.
  */
 struct LightSample
 {
+    uint LightType; ///< Light type this sample comes from (LightType casted to uint).
+    uint LightSubType; ///< Light type for analytic light (LightSubType casted to uint).
     float3 Li;      ///< Incident radiance at the shading point (unshadowed). This is already divided by the pdf.
     float pdf;      ///< Pdf with respect to solid angle at the shading point.
     float3 origin;  ///< Ray origin for visibility evaluation (offseted to avoid self-intersection).
     float distance; ///< Ray distance for visibility evaluation (shortened to avoid self-intersection).
     float3 dir;     ///< Ray direction for visibility evaluation (normalized).
-    uint lightType; ///< Light type this sample comes from (LightType casted to uint).
-    float G;        ///< Geometric term for the sample, i.e. the cosine term and the distance squared term.
-    // float3 pad;
+    float3 posW;    ///< Position in world space for the sample.
+    float3 normalW; ///< Normal in world space for the sample.
 };
 
 struct ReSTIRSample
@@ -26,4 +22,10 @@ struct ReSTIRSample
     // float2 pad;
 };
 
-
+struct Reservoir
+{
+    /* data */
+    ReSTIRSample outputSample;
+    float weightSum = 0;
+    uint M = 0;
+};

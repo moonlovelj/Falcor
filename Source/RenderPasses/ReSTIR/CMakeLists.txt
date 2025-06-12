@@ -3,9 +3,11 @@ add_plugin(ReSTIR)
 target_sources(ReSTIR PRIVATE
     ReSTIR.cpp
     ReSTIR.h
-    ReSTIR.rt.slang
-    GenerateSamples.cs.slang
-    SamplesTypes.slangh
+    PathTracing.rt.slang
+    GenerateSamples.rt.slang
+    Shading.rt.slang
+    ReSTIRCommon.slang
+    ReSTIRStructs.slangh
 )
 
 target_copy_shaders(ReSTIR RenderPasses/ReSTIR)

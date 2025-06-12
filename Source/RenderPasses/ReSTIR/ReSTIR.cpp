@@ -30,13 +30,14 @@
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Rendering/Lights/EmissiveUniformSampler.h"
 #include "Core/API/RenderContext.h"
-#include "SamplesTypes.slangh"
+#include "ReSTIRStructs.slangh"
 #include "Scene/Scene.h"
 
 namespace
 {
-const char kShaderFile[] = "RenderPasses/ReSTIR/ReSTIR.rt.slang";
-const std::string kGenerateSamplesFilename = "RenderPasses/ReSTIR/GenerateSamples.cs.slang";
+const char kShaderFile[] = "RenderPasses/ReSTIR/PathTracing.rt.slang";
+const std::string kGenerateSamplesFilename = "RenderPasses/ReSTIR/GenerateSamples.rt.slang";
+const std::string kShadingFilename = "RenderPasses/ReSTIR/Shading.rt.slang";
 
 // Ray tracing settings that affect the traversal stack size.
 // These should be set as small as possible.
@@ -45,8 +46,7 @@ const uint32_t kMaxRecursionDepth = 2u;
 
 const ChannelList kOutputChannels = {
     // clang-format off
-        { "color",          "gOutputColor",                "Output color (sum of direct and indirect)", false, ResourceFormat::RGBA32Float },
-        { "weight",         "gOutputWeight",                "Output weight (sum of direct and indirect)", false, ResourceFormat::RGBA32Float },
+        { "color",          "gOutputColor",                "Output color (sum of direct and indirect)", false, ResourceFormat::RGBA32Float }
     // clang-format on
 };
 
@@ -62,7 +62,7 @@ const ChannelList kSamplesOutputChannels = {
         { "WY",           "gWY",                                    "WY", false, ResourceFormat::RGBA32Float },
         { "wsum",         "gwsum",                                  "wsum", false, ResourceFormat::RGBA32Float },
         { "phat",         "gphat",                                  "phat", false, ResourceFormat::RGBA32Float },
-        { "ReSTIRColor",  "gOutputColor",                           "ReSTIRColor", false, ResourceFormat::RGBA32Float }
+        // { "ReSTIRColor",  "gOutputColor",                           "ReSTIRColor", false, ResourceFormat::RGBA32Float }
     // clang-format on
 };
 
@@ -70,6 +70,18 @@ const ChannelList kSamplesInputChannels = {
     // clang-format off
         { "vbuffer",        "gVBuffer",                    "Visibility buffer in packed format" },
         { "viewW",          "gViewW",                      "World-space view direction (xyz float format)", true /* optional */ }
+    // clang-format on
+};
+
+const ChannelList kShadingOutputChannels = {
+    // clang-format off
+    { "ShadingColor",  "gOutputColor",                           "ReSTIRColor", false, ResourceFormat::RGBA32Float }
+    // clang-format on
+};
+
+const ChannelList kShadingInputChannels = {
+    // clang-format off
+
     // clang-format on
 };
 
@@ -106,6 +118,7 @@ RenderPassReflection ReSTIR::reflect(const CompileData& compileData)
     addRenderPassInputs(reflector, kInputChannels);
     addRenderPassOutputs(reflector, kOutputChannels);
     addRenderPassOutputs(reflector, kSamplesOutputChannels);
+    addRenderPassOutputs(reflector, kShadingOutputChannels);
 
     return reflector;
 }
@@ -210,7 +223,7 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
 
         uint2 ScreenDim = uint2(pOutputColor->getWidth(), pOutputColor->getHeight());
         uint elemCount = ScreenDim.x * ScreenDim.y;
-        mpSamplesBuffer = mpDevice->createStructuredBuffer(sizeof(ReSTIRSample), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        mpSamplesBuffer = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
 
         setStaticParams(mSamplesTracer.pProgram.get());
 
@@ -247,6 +260,41 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
 
         // Spawn the rays.
         mpScene->raytrace(pRenderContext, mSamplesTracer.pProgram.get(), mSamplesTracer.pVars, uint3(targetDim, 1));
+    }
+
+    {
+        setStaticParams(mShadingTracer.pProgram.get());
+
+        mShadingTracer.pProgram->addDefines(getValidResourceDefines(kSamplesInputChannels, renderData));
+        mShadingTracer.pProgram->addDefines(getValidResourceDefines(kSamplesOutputChannels, renderData));
+
+        prepareShadingVars();
+        FALCOR_ASSERT(mShadingTracer.pVars);
+
+        // Get dimensions of ray dispatch.
+        const uint2 targetDim = renderData.getDefaultTextureDims();
+        FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
+
+        auto var = mShadingTracer.pVars->getRootVar();
+        var["CB"]["gFrameCount"] = mFrameCount;
+        var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
+        // Set up screen space pixel angle for texture LOD using ray cones
+        // var["CB"]["gScreenSpacePixelSpreadAngle"] = mpScene->getCamera()->computeScreenSpacePixelSpreadAngle(targetDim.y);
+        // Bind I/O buffers. These needs to be done per-frame as the buffers may change anytime.
+        auto bind = [&](const ChannelDesc& desc)
+        {
+            if (!desc.texname.empty())
+            {
+                var[desc.texname] = renderData.getTexture(desc.name);
+            }
+        };
+        for (auto channel : kInputChannels)
+            bind(channel);
+        for (auto channel : kShadingOutputChannels)
+            bind(channel);
+
+        // Spawn the rays.
+        mpScene->raytrace(pRenderContext, mShadingTracer.pProgram.get(), mShadingTracer.pVars, uint3(targetDim, 1));
     }
 
     {
@@ -300,6 +348,9 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
     dirty |= widget.var("Candidate Num", mCandidateNum, 1u, 256u);
     widget.tooltip("Candidate Num of ReSTIR.", true);
 
+    dirty |= widget.var("C Cap", mCCap, 1u, 40u);
+    widget.tooltip("C Cap.", true);
+
     dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
     widget.tooltip("Compute direct illumination.\nIf disabled only indirect is computed (when max bounces > 0).", true);
 
@@ -322,6 +373,10 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mSamplesTracer.pProgram = nullptr;
     mSamplesTracer.pBindingTable = nullptr;
     mSamplesTracer.pVars = nullptr;
+
+    mShadingTracer.pProgram = nullptr;
+    mShadingTracer.pBindingTable = nullptr;
+    mShadingTracer.pVars = nullptr;
 
     // Clear data for previous scene.
     // After changing scene, the raytracing program should to be recreated.
@@ -373,6 +428,24 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
         }
 
         {
+            // ray tracing program for shading
+            ProgramDesc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kShadingFilename);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+            desc.setMaxPayloadSize(kMaxPayloadSizeBytes);
+            desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
+            desc.setMaxTraceRecursionDepth(kMaxRecursionDepth);
+
+            mShadingTracer.pBindingTable = RtBindingTable::create(1, 1, mpScene->getGeometryCount());
+            auto& sbt = mShadingTracer.pBindingTable;
+            sbt->setRayGen(desc.addRayGen("rayGen"));
+            sbt->setMiss(0, desc.addMiss("shadowMiss"));
+            sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowAnyHit"));
+            mShadingTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+        }
+
+        {
             // Create ray tracing program.
             ProgramDesc desc;
             desc.addShaderModules(mpScene->getShaderModules());
@@ -419,7 +492,7 @@ void ReSTIR::prepareSamplesVars()
 
         // Bind utility classes into shared data.
         auto var = mSamplesTracer.pVars->getRootVar();
-        var["gOutputSamples"] = mpSamplesBuffer;
+        var["gReservoir"] = mpSamplesBuffer;
         mpSampleGenerator->bindShaderData(var);
 
         if (mpEnvMapSampler && mpReSTIRDataBlock)
@@ -427,6 +500,36 @@ void ReSTIR::prepareSamplesVars()
 
         if (mpEmissiveSampler && mpReSTIRDataBlock)
             mpEmissiveSampler->bindShaderData(mpReSTIRDataBlock->getRootVar()["emissiveSampler"]);
+    }
+
+}
+
+void ReSTIR::prepareShadingVars()
+{
+     FALCOR_ASSERT(mShadingTracer.pProgram);
+     {
+        // Configure program.
+        mShadingTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
+        mShadingTracer.pProgram->setTypeConformances(mpScene->getTypeConformances());
+
+        // Create program variables for the current program.
+        // This may trigger shader compilation. If it fails, throw an exception to abort rendering.
+        mShadingTracer.pVars = RtProgramVars::create(mpDevice, mShadingTracer.pProgram, mShadingTracer.pBindingTable);
+
+        auto reflector = mShadingTracer.pProgram->getReflector()->getParameterBlock("gReSTIRData");
+        ref<ParameterBlock>  ReSTIRDataBlock = ParameterBlock::create(mpDevice, reflector);
+        FALCOR_ASSERT(ReSTIRDataBlock);
+
+        // Bind utility classes into shared data.
+        auto var = mShadingTracer.pVars->getRootVar();
+        var["gReservoir"] = mpSamplesBuffer;
+        mpSampleGenerator->bindShaderData(var);
+
+        if (mpEnvMapSampler && ReSTIRDataBlock)
+            mpEnvMapSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["envMapSampler"]);
+
+        if (mpEmissiveSampler && ReSTIRDataBlock)
+            mpEmissiveSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["emissiveSampler"]);
     }
 
 }
@@ -450,7 +553,7 @@ void ReSTIR::prepareVars()
 
         // Bind utility classes into shared data.
         auto var = mTracer.pVars->getRootVar();
-        var["gSamples"] = mpSamplesBuffer;
+        // var["gSamples"] = mpSamplesBuffer;
         mpSampleGenerator->bindShaderData(var);
 
         if (mpEnvMapSampler && mpReSTIRDataBlock)
@@ -466,6 +569,7 @@ void ReSTIR::setStaticParams(Program* pProgram) const
     DefineList defines;
     defines.add("MAX_BOUNCES", std::to_string(mMaxBounces));
     defines.add("CANDIDATE_NUM", std::to_string(mCandidateNum));
+    defines.add("C_CAP", std::to_string(mCCap));
     defines.add("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     defines.add("USE_NEE", mUseNee ? "1" : "0");
     // defines.add("TEX_LOD_MODE", std::to_string(static_cast<uint32_t>(mTexLODMode)));
@@ -510,12 +614,12 @@ void ReSTIR::generateSamples(RenderContext* pRenderContext, const RenderData& re
 
     if (isScreenDimChanged)
     {
-        mpSamplesBuffer = mpDevice->createStructuredBuffer(sizeof(ReSTIRSample), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        mpSamplesBuffer = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
         // mpSamplesTexture = mpDevice->createTexture2D(screenTiles.x * 16, screenTiles.y * 16, ResourceFormat::RGBA32Uint, 1, 1, nullptr, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     }
 
     mpGenerateSamples->setVars(nullptr);
-    mpGenerateSamples->getRootVar()["gOutputSamples"] = mpSamplesBuffer;
+    mpGenerateSamples->getRootVar()["gReservoir"] = mpSamplesBuffer;
     // mpGenerateSamples->getRootVar()["gOutputTexture"] = mpSamplesTexture;
     // mpGenerateSamples->setVars(nullptr);
     // Bind resources.
