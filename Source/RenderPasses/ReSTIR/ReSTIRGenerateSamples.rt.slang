@@ -8,7 +8,6 @@ import Scene.Intersection;
 import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
-import Rendering.Lights.LightHelpers;
 import Utils.Math.PackedFormats;
 import Scene.HitInfo;
 import Utils.Math.Ray;
@@ -78,9 +77,9 @@ ReSTIRSample GenerateSample(const ShadingData sd, const IMaterialInstance mi, in
 
     Reservoir r;
     InitReservoir(r);
-    float W_Y = 0;
-    float w_sum = 0;
-    float Y_p_hat = 0;
+    float3 W_Y = 0;
+    float3 w_sum = 0;
+    float3 Y_p_hat = 0;
 
     if (hit.isValid())
     {
@@ -109,34 +108,41 @@ ReSTIRSample GenerateSample(const ShadingData sd, const IMaterialInstance mi, in
         // 假设最终选出的样本是Y，Y的无偏贡献权重W_Y= r.weightSum / p_hat_Y;
         if (kComputeDirect)
         {
+            const float m_i = 1.f / kCandidateNum;
             for (uint i = 0; i < kCandidateNum; i++)
             {
                 ReSTIRSample sample = GenerateSample(sd, mi, sg);
                 if (sample.isValid)
                 {
-                    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, sample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
-                    float V = (float)traceShadowRay(origin, sample.lightSample.dir, sample.lightSample.distance);
-                    float G = evalLightSampleG(sample.lightSample, sd);
-                    float p_hat = luminance(mi.eval(sd, sample.lightSample.dir, sg)) * luminance(sample.lightSample.Li) * V * G; // pdf包含在Li中了
-                    float w_i = 1.0 / kCandidateNum * p_hat;
+                    float p_hat = CalculatePhat(sd, mi, sample.lightSample, sg);
+                    float w_i = m_i * p_hat / sample.lightSample.pdf;
                     UpdateReservoir(r, sample, w_i, sg, 1);
                 }
             }
 
             if (r.outputSample.isValid)
             {
-                const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.outputSample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
-                float V = (float)traceShadowRay(origin, r.outputSample.lightSample.dir, r.outputSample.lightSample.distance);
-                float G = evalLightSampleG(r.outputSample.lightSample, sd);
-                float p_hat = luminance(mi.eval(sd, r.outputSample.lightSample.dir, sg)) * luminance(r.outputSample.lightSample.Li * r.outputSample.lightSample.pdf) * G * V;
-                // r.weightSum / p_hat_Y
-                r.outputSample.W = r.weightSum / max(FLT_MIN, p_hat);
+                float p_hat = CalculatePhat(sd, mi, r.outputSample.lightSample, sg);
+                if (p_hat > 0)
+                {
+                    r.outputSample.W = r.weightSum / p_hat;
+                }
+                else
+                {
+                    r.outputSample.W = 0.f;
+                }
 
                 // debug
                 W_Y = r.outputSample.W;
                 Y_p_hat = p_hat;
                 w_sum = r.weightSum;
                 //
+            }
+            else
+            {
+                W_Y = 0;
+                Y_p_hat = 0;
+                w_sum = 0;
             }
 
             gReservoir[pixel.x + pixel.y * frameDim.x] = r;

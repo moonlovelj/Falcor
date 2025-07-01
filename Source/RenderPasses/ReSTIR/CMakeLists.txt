@@ -4,10 +4,12 @@ target_sources(ReSTIR PRIVATE
     ReSTIR.cpp
     ReSTIR.h
     PathTracing.rt.slang
-    GenerateSamples.rt.slang
-    Shading.rt.slang
+    ReSTIRGenerateSamples.rt.slang
+    ReSTIRSpatialReuse.rt.slang
+    ReSTIRShading.rt.slang
     ReSTIRCommon.slang
     ReSTIRStructs.slangh
+    ReSTIRLightHelpers.slang
 )
 
 target_copy_shaders(ReSTIR RenderPasses/ReSTIR)

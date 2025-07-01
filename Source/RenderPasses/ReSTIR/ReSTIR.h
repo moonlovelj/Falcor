@@ -63,9 +63,13 @@ public:
 private:
     void prepareSamplesVars();
     void prepareShadingVars();
+    void prepareSpatialReuseVars();
     void prepareVars();
     void setStaticParams(Program* pProgram) const;
     void generateSamples(RenderContext* pRenderContext, const RenderData& renderData);
+    ref<Buffer> getReservoirReadBuffer();
+    ref<Buffer> getReservoirWriteBuffer();
+    void swapReservoirBuffers();
 
     ref<Scene>                      mpScene;
      /// GPU sample generator.
@@ -82,6 +86,7 @@ private:
 
     ref<ComputePass>                mpGenerateSamples;
     ref<Buffer>                     mpSamplesBuffer;
+    ref<Buffer>                     mpReservoirBuffers[2];
     // ref<Texture>                    mpSamplesTexture;
 
         // Ray tracing program.
@@ -104,8 +109,16 @@ private:
         ref<Program> pProgram;
         ref<RtBindingTable> pBindingTable;
         ref<RtProgramVars> pVars;
+    } mSpatialReuseTracer;
+
+    struct
+    {
+        ref<Program> pProgram;
+        ref<RtBindingTable> pBindingTable;
+        ref<RtProgramVars> pVars;
     } mShadingTracer;
 
+    uint mCurrentReservoirReadIndex = 0;
     uint2 mScreenDim = uint2(0, 0);
 
     // Frame count since scene was loaded.
@@ -114,12 +127,15 @@ private:
     bool mOptionsChanged = false;
 
     /// Max number of indirect bounces (0 = none).
-    uint mMaxBounces = 3;
+    uint mMaxBounces = 0;
     /// Compute direct illumination (otherwise indirect only).
     bool mComputeDirect = true;
 
     bool mUseNee = true;
 
-    uint mCandidateNum = 1;
+    uint mCandidateNum = 4;
     uint mCCap = 20; // 置信度上限
+    uint mSpatialReuseSampleCount = 3; // 空间复用数量
+    uint mSpatialReusePassCount = 1; // 空间复用次数
+    uint mkSpatialReuseRadius = 30; // 空间复用半径
 };

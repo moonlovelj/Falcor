@@ -36,8 +36,9 @@
 namespace
 {
 const char kShaderFile[] = "RenderPasses/ReSTIR/PathTracing.rt.slang";
-const std::string kGenerateSamplesFilename = "RenderPasses/ReSTIR/GenerateSamples.rt.slang";
-const std::string kShadingFilename = "RenderPasses/ReSTIR/Shading.rt.slang";
+const std::string kGenerateSamplesFilename = "RenderPasses/ReSTIR/ReSTIRGenerateSamples.rt.slang";
+const std::string kSpatialReuseFilename = "RenderPasses/ReSTIR/ReSTIRSpatialReuse.rt.slang";
+const std::string kShadingFilename = "RenderPasses/ReSTIR/ReSTIRShading.rt.slang";
 
 // Ray tracing settings that affect the traversal stack size.
 // These should be set as small as possible.
@@ -70,6 +71,21 @@ const ChannelList kSamplesInputChannels = {
     // clang-format off
         { "vbuffer",        "gVBuffer",                    "Visibility buffer in packed format" },
         { "viewW",          "gViewW",                      "World-space view direction (xyz float format)", true /* optional */ }
+    // clang-format on
+};
+
+
+const ChannelList kSpatialReuseInputChannels = {
+    // clang-format off
+    { "depth",          "gDepth",                    "depth buffer" }
+    // clang-format on
+};
+
+const ChannelList kSpatialReuseOutputChannels = {
+    // clang-format off
+    { "SpatialReuseWY",           "gSpatialReuseWY",                                    "WY", false, ResourceFormat::RGBA32Float },
+    { "SpatialReusewsum",         "gSpatialReusewsum",                                  "wsum", false, ResourceFormat::RGBA32Float },
+    { "SpatialReusephat",         "gSpatialReusephat",                                  "phat", false, ResourceFormat::RGBA32Float },
     // clang-format on
 };
 
@@ -116,9 +132,11 @@ RenderPassReflection ReSTIR::reflect(const CompileData& compileData)
     RenderPassReflection reflector;
 
     addRenderPassInputs(reflector, kInputChannels);
+    addRenderPassInputs(reflector, kSpatialReuseInputChannels);
     addRenderPassOutputs(reflector, kOutputChannels);
     addRenderPassOutputs(reflector, kSamplesOutputChannels);
     addRenderPassOutputs(reflector, kShadingOutputChannels);
+    addRenderPassOutputs(reflector, kSpatialReuseOutputChannels);
 
     return reflector;
 }
@@ -223,7 +241,8 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
 
         uint2 ScreenDim = uint2(pOutputColor->getWidth(), pOutputColor->getHeight());
         uint elemCount = ScreenDim.x * ScreenDim.y;
-        mpSamplesBuffer = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        mpReservoirBuffers[0] = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        mpReservoirBuffers[1] = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
 
         setStaticParams(mSamplesTracer.pProgram.get());
 
@@ -263,10 +282,52 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
     }
 
     {
+        for (size_t i = 0; i < mSpatialReusePassCount; i++)
+        {
+            // Spatial reuse pass.
+            setStaticParams(mSpatialReuseTracer.pProgram.get());
+
+            mSpatialReuseTracer.pProgram->addDefines(getValidResourceDefines(kInputChannels, renderData));
+            mSpatialReuseTracer.pProgram->addDefines(getValidResourceDefines(kSpatialReuseInputChannels, renderData));
+            mSpatialReuseTracer.pProgram->addDefines(getValidResourceDefines(kSpatialReuseOutputChannels, renderData));
+
+            prepareSpatialReuseVars();
+            FALCOR_ASSERT(mSpatialReuseTracer.pVars);
+
+            // Get dimensions of ray dispatch.
+            const uint2 targetDim = renderData.getDefaultTextureDims();
+            FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
+
+            auto var = mSpatialReuseTracer.pVars->getRootVar();
+            var["CB"]["gFrameCount"] = mFrameCount;
+            var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
+            // Set up screen space pixel angle for texture LOD using ray cones
+            // var["CB"]["gScreenSpacePixelSpreadAngle"] = mpScene->getCamera()->computeScreenSpacePixelSpreadAngle(targetDim.y);
+            // Bind I/O buffers. These needs to be done per-frame as the buffers may change anytime.
+            auto bind = [&](const ChannelDesc& desc)
+            {
+                if (!desc.texname.empty())
+                {
+                    var[desc.texname] = renderData.getTexture(desc.name);
+                }
+            };
+            for (auto channel : kInputChannels)
+                bind(channel);
+            for (auto channel : kSpatialReuseInputChannels)
+                bind(channel);
+            for (auto channel : kSpatialReuseOutputChannels)
+                bind(channel);
+
+            // Spawn the rays.
+            mpScene->raytrace(pRenderContext, mSpatialReuseTracer.pProgram.get(), mSpatialReuseTracer.pVars, uint3(targetDim, 1));
+        }
+    }
+
+    {
         setStaticParams(mShadingTracer.pProgram.get());
 
-        mShadingTracer.pProgram->addDefines(getValidResourceDefines(kSamplesInputChannels, renderData));
-        mShadingTracer.pProgram->addDefines(getValidResourceDefines(kSamplesOutputChannels, renderData));
+        mShadingTracer.pProgram->addDefines(getValidResourceDefines(kInputChannels, renderData));
+        mShadingTracer.pProgram->addDefines(getValidResourceDefines(kShadingOutputChannels, renderData));
 
         prepareShadingVars();
         FALCOR_ASSERT(mShadingTracer.pVars);
@@ -351,6 +412,15 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
     dirty |= widget.var("C Cap", mCCap, 1u, 40u);
     widget.tooltip("C Cap.", true);
 
+    dirty |= widget.var("Spatial Count", mSpatialReuseSampleCount, 1u, 32u);
+    widget.tooltip("Spatial Reuse Sample Count.", true);
+
+    widget.var("Spatial Pass", mSpatialReusePassCount, 0u, 8u);
+    widget.tooltip("Spatial Reuse Pass Count.", true);
+
+    dirty |= widget.var("Spatial Radius", mkSpatialReuseRadius, 1u, 256u);
+    widget.tooltip("Spatial Reuse Radius.", true);
+
     dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
     widget.tooltip("Compute direct illumination.\nIf disabled only indirect is computed (when max bounces > 0).", true);
 
@@ -373,6 +443,11 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mSamplesTracer.pProgram = nullptr;
     mSamplesTracer.pBindingTable = nullptr;
     mSamplesTracer.pVars = nullptr;
+
+
+    mSpatialReuseTracer.pProgram = nullptr;
+    mSpatialReuseTracer.pBindingTable = nullptr;
+    mSpatialReuseTracer.pVars = nullptr;
 
     mShadingTracer.pProgram = nullptr;
     mShadingTracer.pBindingTable = nullptr;
@@ -425,6 +500,23 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
             sbt->setMiss(0, desc.addMiss("shadowMiss"));
             sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowAnyHit"));
             mSamplesTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+        }
+
+        {
+            ProgramDesc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kSpatialReuseFilename);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+            desc.setMaxPayloadSize(kMaxPayloadSizeBytes);
+            desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
+            desc.setMaxTraceRecursionDepth(kMaxRecursionDepth);
+
+            mSpatialReuseTracer.pBindingTable = RtBindingTable::create(1, 1, mpScene->getGeometryCount());
+            auto& sbt = mSpatialReuseTracer.pBindingTable;
+            sbt->setRayGen(desc.addRayGen("rayGen"));
+            sbt->setMiss(0, desc.addMiss("shadowMiss"));
+            sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowAnyHit"));
+            mSpatialReuseTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
         }
 
         {
@@ -492,7 +584,8 @@ void ReSTIR::prepareSamplesVars()
 
         // Bind utility classes into shared data.
         auto var = mSamplesTracer.pVars->getRootVar();
-        var["gReservoir"] = mpSamplesBuffer;
+        var["gReservoir"] = getReservoirWriteBuffer();
+        swapReservoirBuffers();
         mpSampleGenerator->bindShaderData(var);
 
         if (mpEnvMapSampler && mpReSTIRDataBlock)
@@ -522,7 +615,7 @@ void ReSTIR::prepareShadingVars()
 
         // Bind utility classes into shared data.
         auto var = mShadingTracer.pVars->getRootVar();
-        var["gReservoir"] = mpSamplesBuffer;
+        var["gReservoir"] = getReservoirReadBuffer();
         mpSampleGenerator->bindShaderData(var);
 
         if (mpEnvMapSampler && ReSTIRDataBlock)
@@ -532,6 +625,37 @@ void ReSTIR::prepareShadingVars()
             mpEmissiveSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["emissiveSampler"]);
     }
 
+}
+
+void ReSTIR::prepareSpatialReuseVars()
+{
+    FALCOR_ASSERT(mSpatialReuseTracer.pProgram);
+    {
+        // Configure program.
+        mSpatialReuseTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
+        mSpatialReuseTracer.pProgram->setTypeConformances(mpScene->getTypeConformances());
+
+        // Create program variables for the current program.
+        // This may trigger shader compilation. If it fails, throw an exception to abort rendering.
+        mSpatialReuseTracer.pVars = RtProgramVars::create(mpDevice, mSpatialReuseTracer.pProgram, mSpatialReuseTracer.pBindingTable);
+
+        auto reflector = mSpatialReuseTracer.pProgram->getReflector()->getParameterBlock("gReSTIRData");
+        ref<ParameterBlock>  ReSTIRDataBlock = ParameterBlock::create(mpDevice, reflector);
+        FALCOR_ASSERT(ReSTIRDataBlock);
+
+        // Bind utility classes into shared data.
+        auto var = mSpatialReuseTracer.pVars->getRootVar();
+        var["gReservoirRead"] = getReservoirReadBuffer();
+        var["gReservoirWrite"] = getReservoirWriteBuffer();
+        swapReservoirBuffers();
+        mpSampleGenerator->bindShaderData(var);
+
+        if (mpEnvMapSampler && ReSTIRDataBlock)
+            mpEnvMapSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["envMapSampler"]);
+
+        if (mpEmissiveSampler && ReSTIRDataBlock)
+            mpEmissiveSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["emissiveSampler"]);
+    }
 }
 
 void ReSTIR::prepareVars()
@@ -570,6 +694,8 @@ void ReSTIR::setStaticParams(Program* pProgram) const
     defines.add("MAX_BOUNCES", std::to_string(mMaxBounces));
     defines.add("CANDIDATE_NUM", std::to_string(mCandidateNum));
     defines.add("C_CAP", std::to_string(mCCap));
+    defines.add("SPATIAL_REUSE_SAMPLE_COUNT", std::to_string(mSpatialReuseSampleCount));
+    defines.add("SPATIAL_REUSE_RADIUS", std::to_string(mkSpatialReuseRadius));
     defines.add("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     defines.add("USE_NEE", mUseNee ? "1" : "0");
     // defines.add("TEX_LOD_MODE", std::to_string(static_cast<uint32_t>(mTexLODMode)));
@@ -634,4 +760,19 @@ void ReSTIR::generateSamples(RenderContext* pRenderContext, const RenderData& re
 
 
     mpGenerateSamples->execute(pRenderContext, { screenTiles.x * tileSize, screenTiles.y, 1u });
+}
+
+ref<Buffer> ReSTIR::getReservoirReadBuffer()
+{
+    return mpReservoirBuffers[mCurrentReservoirReadIndex];
+}
+
+ref<Buffer> ReSTIR::getReservoirWriteBuffer()
+{
+   return mpReservoirBuffers[1-mCurrentReservoirReadIndex];
+}
+
+void ReSTIR::swapReservoirBuffers()
+{
+    mCurrentReservoirReadIndex = 1 - mCurrentReservoirReadIndex;
 }

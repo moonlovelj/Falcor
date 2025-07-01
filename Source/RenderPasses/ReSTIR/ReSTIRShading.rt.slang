@@ -9,7 +9,6 @@ import Scene.Intersection;
 import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
-import Rendering.Lights.LightHelpers;
 import Utils.Math.PackedFormats;
 import Scene.HitInfo;
 import Utils.Math.Ray;
@@ -70,11 +69,39 @@ RWTexture2D<float4> gOutputColor;
         Reservoir r = gReservoir[pixel.x + pixel.y * frameDim.x];
         if (r.outputSample.isValid)
         {
-            const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.outputSample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
-            float V = (float)traceShadowRay(origin, r.outputSample.lightSample.dir, r.outputSample.lightSample.distance);
-            float G = evalLightSampleG(r.outputSample.lightSample, sd);
-            outColor = (mi.eval(sd, r.outputSample.lightSample.dir, sg)) * (r.outputSample.lightSample.Li * r.outputSample.lightSample.pdf) * G * V * r.outputSample.W;
+            // const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.outputSample.lightSample.dir) >= 0.f ? sd.faceN : -sd.faceN);
+
+            float3 origin;
+            float3 dir;
+            float distance;
+            GetShadowRayData(sd, r.outputSample.lightSample, origin, dir, distance);
+            // float3 toLight = normalize(r.outputSample.lightSample.posW - sd.posW);
+            float3 toLight = CalcToLight(sd, r.outputSample.lightSample);
+
+            float V = (float)traceShadowRay(origin, dir, distance);
+            float G = evalLightSampleG(sd, r.outputSample.lightSample);
+            outColor = (mi.eval(sd, toLight, sg)) * (r.outputSample.lightSample.Li) * G * V * r.outputSample.W;
         }
+        // else
+        // {
+        //     if (kUseEnvLight)
+        //     {
+        //         float3 rayOrigin = sd.computeRayOrigin();
+        //         BSDFSample bsdfSample;
+        //         if (mi.sample(sd, sg, bsdfSample, kUseImportanceSampling))
+        //         {
+        //             if (bsdfSample.isLobe(LobeType::Transmission))
+        //             {
+        //                 rayOrigin = sd.computeRayOrigin(false);
+        //             }
+        //             bool V = traceShadowRay(rayOrigin, bsdfSample.wo, FLT_MAX);
+        //             if (V)
+        //             {
+        //                 outColor += bsdfSample.weight * gScene.envMap.eval(bsdfSample.wo);
+        //             }
+        //         }
+        //     }
+        // }
 
         outColor += mi.getProperties(sd).emission;
     }
