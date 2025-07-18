@@ -28,6 +28,30 @@ RWTexture2D<float4> gSpatialReusephat;
 
 Texture2D<float4> gDepth;
 
+// 32个样本的蓝噪声偏移表
+static const float2 kNeighborOffsets[MAX_NEIGHBOR_COUNT] =
+{
+    float2(0.48579, -0.58985), float2(-0.53123, 0.52834),
+    float2(0.12323, 0.78771), float2(-0.72332, -0.34252),
+    float2(0.85098, 0.21857), float2(-0.16938, -0.89233),
+    float2(0.41354, 0.21422), float2(-0.21995, 0.38298),
+    float2(0.74861, -0.34131), float2(-0.84175, 0.04615),
+    float2(0.24879, -0.20739), float2(-0.43578, -0.66952),
+    float2(0.01655, -0.53938), float2(0.93839, 0.34443),
+    float2(-0.95462, -0.29792), float2(0.25244, 0.96761),
+    float2(0.67578, 0.6436), float2(-0.64177, -0.09908),
+    float2(-0.0763, 0.03434), float2(0.53664, -0.84381),
+    float2(-0.38942, -0.27863), float2(0.14364, -0.98962),
+    float2(-0.47775, 0.82522), float2(0.89437, -0.1115),
+    float2(-0.73717, 0.46583), float2(0.20367, -0.6628),
+    float2(-0.15174, -0.01017), float2(0.53238, 0.2863),
+    float2(-0.17424, 0.7188), float2(0.64042, -0.00949),
+    float2(-0.6151, -0.59869), float2(0.01211, 0.39537)
+};
+
+static const uint kNeighborOffsetCount = MAX_NEIGHBOR_COUNT;
+static const uint kNeighborOffsetMask = 31; // 32 - 1
+
 [shader("miss")] void shadowMiss(inout ShadowRayData rayData)
 {
     // The miss shader is executed if the ray misses all geometry. Mark as visible.
@@ -44,48 +68,18 @@ Texture2D<float4> gDepth;
         IgnoreHit();
 }
 
-int2 RandomPixelNeighborPixel(int2 currentPixel, uint2 frameDim, inout SampleGenerator sg)
-{
-    int Radius = kSpatialReuseRadius;
-
-    int2 offset = 0;
-    // 使用循环来避免选择自己，这在统计上是纯粹的
-    // 由于选中自己的概率极低，这个循环几乎永远不会执行超过一次
-    do {
-        // 2. 生成 [-R, R] 范围内的随机整数偏移
-        float rand_x = sampleNext1D(sg); // [0, 1)
-        float rand_y = sampleNext1D(sg); // [0, 1)
-
-        offset.x = int(floor(rand_x * (2 * Radius + 1))) - Radius;
-        offset.y = int(floor(rand_y * (2 * Radius + 1))) - Radius;
-
-    } while (offset.x == 0 && offset.y == 0);
-
-    // 3. 计算邻居坐标
-    int2 neighbor_coord = currentPixel + offset;
-
-    // 4. 关键：处理屏幕边界
-    //    使用 clamp 将坐标限制在 [0, screen_dim-1] 的有效范围内
-    neighbor_coord.x = clamp(neighbor_coord.x, 0, (int)frameDim.x - 1);
-    neighbor_coord.y = clamp(neighbor_coord.y, 0, (int)frameDim.y - 1);
-
-    return neighbor_coord;
-}
-
 bool NeighborRejection(in ShadingData sd, in IMaterialInstance mi, in ShadingData sdNeighbor, in IMaterialInstance miNeighbor
-    , float current_depth, float neighbor_depth)
+    , float current_depth, float neighbor_depth, float3 cam_pos)
 {
-    if (dot(sd.getOrientedFaceNormal(), sdNeighbor.getOrientedFaceNormal()) < 0.9f)
+    if (dot(sd.getOrientedFaceNormal(), sdNeighbor.getOrientedFaceNormal()) < 0.5f)
     {
         return true;
     }
 
-    if (length(sd.posW - sdNeighbor.posW) > 200.f)
-    {
-        return true;
-    }
+    float centralDist = length(cam_pos-sd.posW);
+    float neighborDist = length(cam_pos-sdNeighbor.posW);
 
-    if (abs(current_depth - neighbor_depth) > 0.01f)
+    if (abs(centralDist - neighborDist) >= 0.1f * centralDist)
     {
         return true;
     }
@@ -199,7 +193,7 @@ float CalculateBalanceHeuristicMIS(
             else
             {
                 // 否则，使用其他候选者的上下文
-                denominator += c_other * CalculatePhat(sd_other, mi_other, r_other.outputSample.lightSample, in_sg);
+                denominator += c_other * CalculatePhat(sd_other, mi_other, r_origin.outputSample.lightSample, in_sg);
             }
         }
     }
@@ -253,16 +247,22 @@ float CalculateBalanceHeuristicMIS(
         float c_total = 0.f;
         float c_current = 0.f;
 
+        uint startIndex = uint(sampleNext1D(sg) * kNeighborOffsetCount);
         for (uint i = 0; i < kSpatialReuseSampleCount && i < MAX_NEIGHBOR_COUNT; i++)
         {
-            uint2 neighborPixel = RandomPixelNeighborPixel(pixel, frameDim, sg);
+            uint offsetIndex = (startIndex + i) & kNeighborOffsetMask;
+            float2 offset = kNeighborOffsets[offsetIndex];
+            int2 neighborPixel = int2(pixel + offset * kSpatialReuseRadius);
+
+            if (all(neighborPixel == pixel)) continue;
+
             Reservoir neighborReservoir = gReservoirRead[neighborPixel.x + neighborPixel.y * frameDim.x];
             if (neighborReservoir.outputSample.isValid)
             {
                 ShadingData neighborSd;
                 IMaterialInstance neighborMi;
                 if (GetNeighborPixelInfo(neighborPixel, frameDim, neighborSd, neighborMi) &&
-                    !NeighborRejection(sd, mi, neighborSd, neighborMi, gDepth[pixel].r, gDepth[neighborPixel].r))
+                    !NeighborRejection(sd, mi, neighborSd, neighborMi, gDepth[pixel].r, gDepth[neighborPixel].r, primaryRayOrigin))
                 {
                     neighborPixels[NumValidNeighbors] = neighborPixel;
                     neighborReservoirs[NumValidNeighbors++] = neighborReservoir;
