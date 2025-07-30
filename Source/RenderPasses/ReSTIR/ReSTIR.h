@@ -63,6 +63,7 @@ public:
 private:
     void prepareSamplesVars();
     void prepareShadingVars();
+    void prepareTemporalReuseVars();
     void prepareSpatialReuseVars();
     void prepareVars();
     void setStaticParams(Program* pProgram) const;
@@ -87,7 +88,10 @@ private:
     ref<ComputePass>                mpGenerateSamples;
     ref<Buffer>                     mpSamplesBuffer;
     ref<Buffer>                     mpReservoirBuffers[2];
+    ref<Buffer>                     mpPrevFrameReservoirBuffer;
     // ref<Texture>                    mpSamplesTexture;
+
+    ref<Texture>                    mpPrevVBuffer;
 
         // Ray tracing program.
     struct
@@ -109,6 +113,13 @@ private:
         ref<Program> pProgram;
         ref<RtBindingTable> pBindingTable;
         ref<RtProgramVars> pVars;
+    } mTemporalReuseTracer;
+
+    struct
+    {
+        ref<Program> pProgram;
+        ref<RtBindingTable> pBindingTable;
+        ref<RtProgramVars> pVars;
     } mSpatialReuseTracer;
 
     struct
@@ -120,6 +131,7 @@ private:
 
     uint mCurrentReservoirReadIndex = 0;
     uint2 mScreenDim = uint2(0, 0);
+    bool mPrevFrameReservoirValid = false;
 
     // Frame count since scene was loaded.
     uint mFrameCount = 0;
@@ -132,6 +144,7 @@ private:
     bool mComputeDirect = true;
 
     bool mUseNee = true;
+    bool mUseTemporalReuse = false;
 
     uint mCandidateNum = 4;
     uint mCCap = 20; // 置信度上限

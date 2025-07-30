@@ -5,6 +5,7 @@ target_sources(ReSTIR PRIVATE
     ReSTIR.h
     PathTracing.rt.slang
     ReSTIRGenerateSamples.rt.slang
+    ReSTIRTemporalReuse.rt.slang
     ReSTIRSpatialReuse.rt.slang
     ReSTIRShading.rt.slang
     ReSTIRCommon.slang

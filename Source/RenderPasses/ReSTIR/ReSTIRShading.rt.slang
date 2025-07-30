@@ -48,11 +48,12 @@ RWTexture2D<float4> gOutputColor;
     const HitInfo hit = HitInfo(gVBuffer[pixel]);
 
     float3 outColor = float3(0.f);
+    const uint bufferIndex = pixel.x + pixel.y * frameDim.x;
 
     if (hit.isValid())
     {
         // Load shading data.
-        ShadingData sd = loadShadingData(hit, primaryRayOrigin, primaryRayDir);
+        ShadingData sd = loadShadingData(hit, primaryRayDir);
 
         // Create material instance at shading point.
         let lod = ExplicitLodTextureSampler(0.f);

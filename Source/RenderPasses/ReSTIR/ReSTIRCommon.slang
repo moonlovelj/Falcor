@@ -31,6 +31,9 @@ static const bool kSpatialReuseSampleCount = SPATIAL_REUSE_SAMPLE_COUNT;
 static const bool kUseImportanceSampling = true;
 
 static const float3 kDefaultBackgroundColor = float3(0.f, 0.f, 0.f);
+static const float kSmallFloat = 1e-6f;
+
+#define MAX_NEIGHBOR_COUNT 32
 
 Texture2D<PackedHitInfo> gVBuffer;
 
@@ -82,7 +85,7 @@ struct ShadowRayData
 /**
  * Helper to load G-buffer data and prepare shading data.
  */
-ShadingData loadShadingData(const HitInfo hit, const float3 rayOrigin, const float3 rayDir)
+ShadingData loadShadingData(const HitInfo hit, const float3 rayDir)
 {
     VertexData v = {};
     uint materialID = {};
@@ -361,7 +364,7 @@ void GetShadowRayData(
     else if (ls.LightType == uint(SceneLightType::Emissive))
     {
         float3 lightVector = ls.posW - origin;
-        distance = length(lightVector) - 1e-6;
+        distance = length(lightVector) - kSmallFloat;
         dir = normalize(lightVector);
     }
     else if (ls.LightType == uint(SceneLightType::Analytic))
@@ -375,7 +378,7 @@ void GetShadowRayData(
             case LightType::Disc:
             {
                 float3 lightVector = ls.posW - origin;
-                distance = length(lightVector) - 1e-6;
+                distance = length(lightVector) - kSmallFloat;
                 dir = normalize(lightVector);
                 break;
             }
@@ -553,18 +556,23 @@ float CalculatePhat(ShadingData sd, IMaterialInstance mi, LightSample ls, inout 
 
     float G = evalLightSampleG(sd, ls);
 
-    float3 origin;
-    float3 dir;
-    float distance;
-    GetShadowRayData(sd, ls, origin, dir, distance);
+    // float3 origin;
+    // float3 dir;
+    // float distance;
+    // GetShadowRayData(sd, ls, origin, dir, distance);
 
-    float V = traceShadowRay(origin, dir, distance) ? 1.f : 0.f;
+    // float V = traceShadowRay(origin, dir, distance) ? 1.f : 0.f;
 
     // 2. 计算无可见性的路径贡献
-    float3 contribution = mi.eval(sd, toLight, sg) * ls.Li * G * V;
+    float3 contribution = mi.eval(sd, toLight, sg) * ls.Li * G;
 
     // 3. 返回一个标量代表 p_hat
     return max(0.f, luminance(contribution));
+}
+
+bool isValidScreenRegion(int2 pixel, int2 frameDim)
+{
+    return all(pixel >= 0 && pixel < frameDim);
 }
 
 void InitReservoir(inout Reservoir r)
@@ -585,9 +593,70 @@ void InitReservoir(inout Reservoir r)
 void UpdateReservoir(inout Reservoir r, in ReSTIRSample inSample, float weight, inout SampleGenerator sg, uint c)
 {
     r.M += c;
+
+    if (isnan(weight) || isinf(weight) || weight <= 0.f)
+    {
+        // Invalid weight, do not update the reservoir.
+        return;
+    }
+
     r.weightSum += weight;
-    if (r.weightSum > 0.f && sampleNext1D(sg) < weight / r.weightSum)
+    if (sampleNext1D(sg) < weight / r.weightSum)
     {
         r.outputSample = inSample;
     }
+}
+
+/**
+ * 使用平衡启发式，计算指定候选样本的 MIS 权重。
+ * @param candidate_idx 要计算权重的候选样本在 all_reservoirs 数组中的索引。
+ * @param all_reservoirs 包含所有候选者（canonical + non-canonical）的 Reservoir 数组。
+ * @param all_contexts 包含所有候选者对应上下文（ShadingData, etc.）的数组。
+ * @param num_total_candidates 候选者总数。
+ */
+float CalculateBalanceHeuristicMIS(
+    uint candidate_idx,
+    const Reservoir all_reservoirs[MAX_NEIGHBOR_COUNT + 1],
+    const ShadingData all_sd[MAX_NEIGHBOR_COUNT + 1],
+    const IMaterialInstance all_mi[MAX_NEIGHBOR_COUNT + 1],
+    const uint num_total_candidates,
+    inout SampleGenerator in_sg
+)
+{
+    Reservoir r_origin = all_reservoirs[candidate_idx];
+    float c_origin = r_origin.M;
+    ShadingData sd_origin = all_sd[candidate_idx];
+    IMaterialInstance mi_origin = all_mi[candidate_idx];
+
+    // --- 分子 ---
+    float numerator = c_origin * CalculatePhat(sd_origin, mi_origin, r_origin.outputSample.lightSample, in_sg);
+
+    // --- 分母 ---
+    float denominator = 0.f;
+    for (uint k = 0; k < num_total_candidates; k++)
+    {
+        Reservoir r_other = all_reservoirs[k];
+        float c_other = r_other.M;
+
+         // 计算其他候选者的贡献
+        if (k == candidate_idx)
+        {
+            // 如果是原始候选者，使用 numerator
+            denominator += numerator;
+        }
+        else
+        {
+            // 否则，使用其他候选者的上下文
+            ShadingData sd_other = all_sd[k];
+            IMaterialInstance mi_other = all_mi[k];
+            denominator += c_other * CalculatePhat(sd_other, mi_other, r_origin.outputSample.lightSample, in_sg);
+        }
+    }
+
+    if (denominator > kSmallFloat)
+    {
+        return numerator / denominator;
+    }
+
+    return 0.f;
 }

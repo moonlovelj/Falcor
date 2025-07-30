@@ -37,6 +37,7 @@ namespace
 {
 const char kShaderFile[] = "RenderPasses/ReSTIR/PathTracing.rt.slang";
 const std::string kGenerateSamplesFilename = "RenderPasses/ReSTIR/ReSTIRGenerateSamples.rt.slang";
+const std::string kTemporalReuseFilename = "RenderPasses/ReSTIR/ReSTIRTemporalReuse.rt.slang";
 const std::string kSpatialReuseFilename = "RenderPasses/ReSTIR/ReSTIRSpatialReuse.rt.slang";
 const std::string kShadingFilename = "RenderPasses/ReSTIR/ReSTIRShading.rt.slang";
 
@@ -89,6 +90,21 @@ const ChannelList kSpatialReuseOutputChannels = {
     // clang-format on
 };
 
+const ChannelList kTemporalReuseInputChannels = {
+    // clang-format off
+    { "depth",          "gDepth",                    "depth buffer" },
+    { "mvec",           "gMotionVectors",            "Motion vectors" }
+    // clang-format on
+};
+
+const ChannelList kTemporalReuseOutputChannels = {
+    // clang-format off
+    { "TemporalReuseWY",           "gTemporalReuseWY",                                    "WY", false, ResourceFormat::RGBA32Float },
+    { "TemporalReusewsum",         "gTemporalReusewsum",                                  "wsum", false, ResourceFormat::RGBA32Float },
+    { "TemporalReusephat",         "gTemporalReusephat",                                  "phat", false, ResourceFormat::RGBA32Float },
+    // clang-format on
+};
+
 const ChannelList kShadingOutputChannels = {
     // clang-format off
     { "ShadingColor",  "gOutputColor",                           "ReSTIRColor", false, ResourceFormat::RGBA32Float }
@@ -132,10 +148,12 @@ RenderPassReflection ReSTIR::reflect(const CompileData& compileData)
     RenderPassReflection reflector;
 
     addRenderPassInputs(reflector, kInputChannels);
+    addRenderPassInputs(reflector, kTemporalReuseInputChannels);
     addRenderPassInputs(reflector, kSpatialReuseInputChannels);
     addRenderPassOutputs(reflector, kOutputChannels);
     addRenderPassOutputs(reflector, kSamplesOutputChannels);
     addRenderPassOutputs(reflector, kShadingOutputChannels);
+    addRenderPassOutputs(reflector, kTemporalReuseOutputChannels);
     addRenderPassOutputs(reflector, kSpatialReuseOutputChannels);
 
     return reflector;
@@ -164,13 +182,17 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
         return;
     }
 
+    const auto& pOutputColor = renderData.getTexture("color");
+    uint2 ScreenDim = uint2(pOutputColor->getWidth(), pOutputColor->getHeight());
+    bool isScreenDimChanged = any(mScreenDim != ScreenDim);
+    mScreenDim = ScreenDim;
+
     // Check for scene changes that require shader recompilation.
     if (is_set(mpScene->getUpdates(), IScene::UpdateFlags::RecompileNeeded) ||
         is_set(mpScene->getUpdates(), IScene::UpdateFlags::GeometryChanged))
     {
         FALCOR_THROW("This render pass does not support scene changes that require shader recompilation.");
     }
-
 
     // Request the light collection if emissive lights are enabled.
     if (mpScene->getRenderSettings().useEmissiveLights)
@@ -233,16 +255,18 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
     }
 
 
-    // generateSamples(pRenderContext, renderData);
     {
+        if (isScreenDimChanged)
+        {
+            uint elemCount = mScreenDim.x * mScreenDim.y;
+            mpReservoirBuffers[0] = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+            mpReservoirBuffers[1] = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        }
 
-        const auto& pOutputColor = renderData.getTexture("color");
-        FALCOR_ASSERT(pOutputColor);
-
-        uint2 ScreenDim = uint2(pOutputColor->getWidth(), pOutputColor->getHeight());
-        uint elemCount = ScreenDim.x * ScreenDim.y;
-        mpReservoirBuffers[0] = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
-        mpReservoirBuffers[1] = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        if (!mpPrevVBuffer || isScreenDimChanged)
+        {
+            mpPrevVBuffer = mpDevice->createTexture2D(mScreenDim.x, mScreenDim.y, mpScene->getHitInfo().getFormat(), 1, 1);
+        }
 
         setStaticParams(mSamplesTracer.pProgram.get());
 
@@ -279,6 +303,55 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
 
         // Spawn the rays.
         mpScene->raytrace(pRenderContext, mSamplesTracer.pProgram.get(), mSamplesTracer.pVars, uint3(targetDim, 1));
+    }
+
+    {
+        mPrevFrameReservoirValid = !isScreenDimChanged;
+        if (isScreenDimChanged)
+        {
+            uint elemCount = mScreenDim.x * mScreenDim.y;
+            mpPrevFrameReservoirBuffer = mpDevice->createStructuredBuffer(sizeof(Reservoir), elemCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        }
+
+        if (mPrevFrameReservoirValid && mUseTemporalReuse)
+        {
+            // Temporal reuse pass.
+            setStaticParams(mTemporalReuseTracer.pProgram.get());
+
+            mTemporalReuseTracer.pProgram->addDefines(getValidResourceDefines(kInputChannels, renderData));
+            mTemporalReuseTracer.pProgram->addDefines(getValidResourceDefines(kTemporalReuseInputChannels, renderData));
+            mTemporalReuseTracer.pProgram->addDefines(getValidResourceDefines(kTemporalReuseOutputChannels, renderData));
+
+            prepareTemporalReuseVars();
+            FALCOR_ASSERT(mTemporalReuseTracer.pVars);
+
+            // Get dimensions of ray dispatch.
+            const uint2 targetDim = renderData.getDefaultTextureDims();
+            FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
+
+            auto var = mTemporalReuseTracer.pVars->getRootVar();
+            var["CB"]["gFrameCount"] = mFrameCount;
+            var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
+            // Set up screen space pixel angle for texture LOD using ray cones
+            // var["CB"]["gScreenSpacePixelSpreadAngle"] = mpScene->getCamera()->computeScreenSpacePixelSpreadAngle(targetDim.y);
+            // Bind I/O buffers. These needs to be done per-frame as the buffers may change anytime.
+            auto bind = [&](const ChannelDesc& desc)
+            {
+                if (!desc.texname.empty())
+                {
+                    var[desc.texname] = renderData.getTexture(desc.name);
+                }
+            };
+            for (auto channel : kInputChannels)
+                bind(channel);
+            for (auto channel : kTemporalReuseInputChannels)
+                bind(channel);
+            for (auto channel : kTemporalReuseOutputChannels)
+                bind(channel);
+
+            // Spawn the rays.
+            mpScene->raytrace(pRenderContext, mTemporalReuseTracer.pProgram.get(), mTemporalReuseTracer.pVars, uint3(targetDim, 1));
+        }
     }
 
     {
@@ -396,6 +469,13 @@ void ReSTIR::execute(RenderContext* pRenderContext, const RenderData& renderData
         mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(targetDim, 1));
     }
 
+    {
+        pRenderContext->copyBufferRegion(mpPrevFrameReservoirBuffer.get(), 0, getReservoirReadBuffer().get(), 0, mScreenDim.x * mScreenDim.y * sizeof(Reservoir));
+        // pRenderContext->submit(true);
+
+        pRenderContext->copyResource(mpPrevVBuffer.get(), renderData["vbuffer"].get());
+    }
+
     mFrameCount++;
 }
 
@@ -409,7 +489,7 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
     dirty |= widget.var("Candidate Num", mCandidateNum, 1u, 256u);
     widget.tooltip("Candidate Num of ReSTIR.", true);
 
-    dirty |= widget.var("C Cap", mCCap, 1u, 40u);
+    dirty |= widget.var("C Cap", mCCap, 1u, 400u);
     widget.tooltip("C Cap.", true);
 
     dirty |= widget.var("Spatial Count", mSpatialReuseSampleCount, 1u, 32u);
@@ -426,6 +506,9 @@ void ReSTIR::renderUI(Gui::Widgets& widget)
 
     dirty |= widget.checkbox("Use Nee", mUseNee);
     widget.tooltip("Use Nee.\nIf disabled only bsdf is sampled (when max bounces > 0).", true);
+
+    dirty |= widget.checkbox("Use Temporal Reuse", mUseTemporalReuse);
+    widget.tooltip("Use Temporal Reuse.", true);
 
     // If rendering options that modify the output have changed, set flag to indicate that.
     // In execute() we will pass the flag to other passes for reset of temporal data etc.
@@ -444,6 +527,9 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mSamplesTracer.pBindingTable = nullptr;
     mSamplesTracer.pVars = nullptr;
 
+    mTemporalReuseTracer.pProgram = nullptr;
+    mTemporalReuseTracer.pBindingTable = nullptr;
+    mTemporalReuseTracer.pVars = nullptr;
 
     mSpatialReuseTracer.pProgram = nullptr;
     mSpatialReuseTracer.pBindingTable = nullptr;
@@ -500,6 +586,23 @@ void ReSTIR::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
             sbt->setMiss(0, desc.addMiss("shadowMiss"));
             sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowAnyHit"));
             mSamplesTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+        }
+
+        {
+            ProgramDesc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kTemporalReuseFilename);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+            desc.setMaxPayloadSize(kMaxPayloadSizeBytes);
+            desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
+            desc.setMaxTraceRecursionDepth(kMaxRecursionDepth);
+
+            mTemporalReuseTracer.pBindingTable = RtBindingTable::create(1, 1, mpScene->getGeometryCount());
+            auto& sbt = mTemporalReuseTracer.pBindingTable;
+            sbt->setRayGen(desc.addRayGen("rayGen"));
+            sbt->setMiss(0, desc.addMiss("shadowMiss"));
+            sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowAnyHit"));
+            mTemporalReuseTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
         }
 
         {
@@ -625,6 +728,39 @@ void ReSTIR::prepareShadingVars()
             mpEmissiveSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["emissiveSampler"]);
     }
 
+}
+
+void ReSTIR::prepareTemporalReuseVars()
+{
+    FALCOR_ASSERT(mTemporalReuseTracer.pProgram);
+    {
+        // Configure program.
+        mTemporalReuseTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
+        mTemporalReuseTracer.pProgram->setTypeConformances(mpScene->getTypeConformances());
+
+        // Create program variables for the current program.
+        // This may trigger shader compilation. If it fails, throw an exception to abort rendering.
+        mTemporalReuseTracer.pVars = RtProgramVars::create(mpDevice, mTemporalReuseTracer.pProgram, mTemporalReuseTracer.pBindingTable);
+
+        auto reflector = mTemporalReuseTracer.pProgram->getReflector()->getParameterBlock("gReSTIRData");
+        ref<ParameterBlock>  ReSTIRDataBlock = ParameterBlock::create(mpDevice, reflector);
+        FALCOR_ASSERT(ReSTIRDataBlock);
+
+        // Bind utility classes into shared data.
+        auto var = mTemporalReuseTracer.pVars->getRootVar();
+        var["gPrevFrameReservoir"] = mpPrevFrameReservoirBuffer;
+        var["gPrevVbuffer"] = mpPrevVBuffer;
+        var["gCurrentFrameReservoirRead"] = getReservoirReadBuffer();
+        var["gCurrentFrameReservoirWrite"] = getReservoirWriteBuffer();
+        swapReservoirBuffers();
+        mpSampleGenerator->bindShaderData(var);
+
+        if (mpEnvMapSampler && ReSTIRDataBlock)
+            mpEnvMapSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["envMapSampler"]);
+
+        if (mpEmissiveSampler && ReSTIRDataBlock)
+            mpEmissiveSampler->bindShaderData(ReSTIRDataBlock->getRootVar()["emissiveSampler"]);
+    }
 }
 
 void ReSTIR::prepareSpatialReuseVars()

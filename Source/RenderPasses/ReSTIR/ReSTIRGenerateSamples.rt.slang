@@ -84,7 +84,7 @@ ReSTIRSample GenerateSample(const ShadingData sd, const IMaterialInstance mi, in
     if (hit.isValid())
     {
         // Load shading data.
-        ShadingData sd = loadShadingData(hit, primaryRayOrigin, primaryRayDir);
+        ShadingData sd = loadShadingData(hit, primaryRayDir);
 
         // Create material instance at shading point.
         let lod = ExplicitLodTextureSampler(0.f);
@@ -112,10 +112,10 @@ ReSTIRSample GenerateSample(const ShadingData sd, const IMaterialInstance mi, in
             for (uint i = 0; i < kCandidateNum; i++)
             {
                 ReSTIRSample sample = GenerateSample(sd, mi, sg);
-                if (sample.isValid)
+                if (sample.isValid && sample.lightSample.pdf > kSmallFloat)
                 {
                     float p_hat = CalculatePhat(sd, mi, sample.lightSample, sg);
-                    float w_i = m_i * p_hat / sample.lightSample.pdf;
+                    float w_i = p_hat / sample.lightSample.pdf;
                     UpdateReservoir(r, sample, w_i, sg, 1);
                 }
             }
@@ -123,9 +123,9 @@ ReSTIRSample GenerateSample(const ShadingData sd, const IMaterialInstance mi, in
             if (r.outputSample.isValid)
             {
                 float p_hat = CalculatePhat(sd, mi, r.outputSample.lightSample, sg);
-                if (p_hat > 0)
+                if (p_hat > kSmallFloat)
                 {
-                    r.outputSample.W = r.weightSum / p_hat;
+                    r.outputSample.W = r.weightSum / p_hat / r.M;
                 }
                 else
                 {

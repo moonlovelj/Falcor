@@ -18,8 +18,6 @@ import Rendering.Lights.EmissiveLightSamplerHelpers;
 
 static const int kSpatialReuseRadius = SPATIAL_REUSE_RADIUS;
 
-#define MAX_NEIGHBOR_COUNT 32
-
 RWStructuredBuffer<Reservoir> gReservoirRead;
 RWStructuredBuffer<Reservoir> gReservoirWrite;
 RWTexture2D<float4> gSpatialReuseWY;
@@ -94,7 +92,7 @@ bool GetNeighborPixelInfo(const uint2 pixel, const uint2 frameDim, out ShadingDa
     {
         const float3 primaryRayOrigin = gScene.camera.getPosition();
         const float3 rayDir = getPrimaryRayDir(pixel, frameDim, gScene.camera);
-        sd = loadShadingData(hitInfo, primaryRayOrigin, rayDir);
+        sd = loadShadingData(hitInfo, rayDir);
         let lod = ExplicitLodTextureSampler(0.f);
         mi = gScene.materials.getMaterialInstance(sd, lod);
         return true;
@@ -144,68 +142,6 @@ bool GetNeighborPixelInfo(const uint2 pixel, const uint2 frameDim, out ShadingDa
 //     return 0.f;
 // }
 
-/**
- * 使用平衡启发式，计算指定候选样本的 MIS 权重。
- * @param candidate_idx 要计算权重的候选样本在 all_reservoirs 数组中的索引。
- * @param all_reservoirs 包含所有候选者（canonical + non-canonical）的 Reservoir 数组。
- * @param all_contexts 包含所有候选者对应上下文（ShadingData, etc.）的数组。
- * @param num_total_candidates 候选者总数。
- */
-float CalculateBalanceHeuristicMIS(
-    uint candidate_idx,
-    const uint2 frameDim,
-    const Reservoir all_reservoirs[MAX_NEIGHBOR_COUNT + 1],
-    const uint2 all_pixels[MAX_NEIGHBOR_COUNT + 1],
-    const uint num_total_candidates,
-    inout SampleGenerator in_sg
-)
-{
-    uint2 origin_pixel = all_pixels[candidate_idx];
-    Reservoir r_origin = all_reservoirs[candidate_idx];
-    float c_origin = r_origin.M;
-    ShadingData sd_origin;
-    IMaterialInstance mi_origin;
-    if (!GetNeighborPixelInfo(origin_pixel, frameDim, sd_origin, mi_origin))
-    {
-        return 0.f;
-    }
-
-    // --- 分子 ---
-    float numerator = c_origin * CalculatePhat(sd_origin, mi_origin, r_origin.outputSample.lightSample, in_sg);
-
-    // --- 分母 ---
-    float denominator = 0.f;
-    for (uint k = 0; k < num_total_candidates; k++)
-    {
-        Reservoir r_other = all_reservoirs[k];
-        float c_other = r_other.M;
-
-        ShadingData sd_other;
-        IMaterialInstance mi_other;
-        if (GetNeighborPixelInfo(all_pixels[k], frameDim, sd_other, mi_other))
-        {
-            // 计算其他候选者的贡献
-            if (k == candidate_idx)
-            {
-                // 如果是原始候选者，使用 numerator
-                denominator += numerator;
-            }
-            else
-            {
-                // 否则，使用其他候选者的上下文
-                denominator += c_other * CalculatePhat(sd_other, mi_other, r_origin.outputSample.lightSample, in_sg);
-            }
-        }
-    }
-
-    if (denominator > 0.f)
-    {
-        return numerator / max(FLT_MIN, denominator);
-    }
-
-    return 0.f;
-}
-
 [shader("raygeneration")] void rayGen()
 {
     uint2 pixel = DispatchRaysIndex().xy;
@@ -226,7 +162,7 @@ float CalculateBalanceHeuristicMIS(
     if (hit.isValid() && CurrentReservoir.outputSample.isValid)
     {
         // // Load shading data.
-        ShadingData sd = loadShadingData(hit, primaryRayOrigin, primaryRayDir);
+        ShadingData sd = loadShadingData(hit, primaryRayDir);
 
         // Create material instance at shading point.
         let lod = ExplicitLodTextureSampler(0.f);
@@ -242,6 +178,8 @@ float CalculateBalanceHeuristicMIS(
 
         Reservoir neighborReservoirs[MAX_NEIGHBOR_COUNT + 1];
         uint2 neighborPixels[MAX_NEIGHBOR_COUNT + 1];
+        ShadingData sds[MAX_NEIGHBOR_COUNT + 1];
+        IMaterialInstance mis[MAX_NEIGHBOR_COUNT + 1];
         uint NumValidNeighbors = 0;
 
         float c_total = 0.f;
@@ -255,6 +193,7 @@ float CalculateBalanceHeuristicMIS(
             int2 neighborPixel = int2(pixel + offset * kSpatialReuseRadius);
 
             if (all(neighborPixel == pixel)) continue;
+            if (!isValidScreenRegion(neighborPixel, frameDim)) continue;
 
             Reservoir neighborReservoir = gReservoirRead[neighborPixel.x + neighborPixel.y * frameDim.x];
             if (neighborReservoir.outputSample.isValid)
@@ -265,6 +204,8 @@ float CalculateBalanceHeuristicMIS(
                     !NeighborRejection(sd, mi, neighborSd, neighborMi, gDepth[pixel].r, gDepth[neighborPixel].r, primaryRayOrigin))
                 {
                     neighborPixels[NumValidNeighbors] = neighborPixel;
+                    sds[NumValidNeighbors] = neighborSd;
+                    mis[NumValidNeighbors] = neighborMi;
                     neighborReservoirs[NumValidNeighbors++] = neighborReservoir;
                     c_total += neighborReservoir.M;
                 }
@@ -275,6 +216,8 @@ float CalculateBalanceHeuristicMIS(
         c_total += c_current;
 
         neighborPixels[NumValidNeighbors] = pixel;
+        sds[NumValidNeighbors] = sd;
+        mis[NumValidNeighbors] = mi;
         neighborReservoirs[NumValidNeighbors++] = CurrentReservoir;
 
         Reservoir r;
@@ -282,23 +225,32 @@ float CalculateBalanceHeuristicMIS(
 
         for (uint i = 0; i < NumValidNeighbors; i++)
         {
-            uint2 neighborPixel = neighborPixels[i];
-            ShadingData neighborSd;
-            IMaterialInstance neighborMi;
-            if (GetNeighborPixelInfo(neighborPixel, frameDim, neighborSd, neighborMi))
-            {
-                float m = CalculateBalanceHeuristicMIS(i, frameDim, neighborReservoirs, neighborPixels, NumValidNeighbors, sg);
-                float w_i = m * CalculatePhat(sd, mi, neighborReservoirs[i].outputSample.lightSample, sg) * neighborReservoirs[i].outputSample.W;
-                UpdateReservoir(r, neighborReservoirs[i].outputSample, w_i, sg, neighborReservoirs[i].M);
-            }
+            // float m = CalculateBalanceHeuristicMIS(i, neighborReservoirs, sds, mis, NumValidNeighbors, sg);
+            // float w_i = m * CalculatePhat(sd, mi, neighborReservoirs[i].outputSample.lightSample, sg) * neighborReservoirs[i].outputSample.W;
+
+            float w_i = CalculatePhat(sd, mi, neighborReservoirs[i].outputSample.lightSample, sg) * neighborReservoirs[i].outputSample.W * neighborReservoirs[i].M;
+            UpdateReservoir(r, neighborReservoirs[i].outputSample, w_i, sg, neighborReservoirs[i].M);
         }
 
         if (r.outputSample.isValid)
         {
-            float p_hat = CalculatePhat(sd, mi, r.outputSample.lightSample, sg);
-            if (p_hat > 0.f)
+            float Z = 0.f;
+            for (uint i = 0; i < NumValidNeighbors; i++)
             {
-                r.outputSample.W = r.weightSum / max(FLT_MIN, p_hat);
+                // float m = CalculateBalanceHeuristicMIS(i, neighborReservoirs, sds, mis, NumValidNeighbors, sg);
+                // float w_i = m * CalculatePhat(sd, mi, neighborReservoirs[i].outputSample.lightSample, sg) * neighborReservoirs[i].outputSample.W;
+
+                if (CalculatePhat(sds[i], mis[i], r.outputSample.lightSample, sg) > 0)
+                {
+                    Z += neighborReservoirs[i].M;
+                }
+
+            }
+
+            float p_hat = CalculatePhat(sd, mi, r.outputSample.lightSample, sg);
+            if (p_hat > kSmallFloat && Z > kSmallFloat)
+            {
+                r.outputSample.W = r.weightSum / p_hat / Z;
             }
             else
             {
@@ -307,7 +259,7 @@ float CalculateBalanceHeuristicMIS(
 
             // debug
             W_Y = r.outputSample.W;
-            Y_p_hat = p_hat;
+            Y_p_hat = p_hat * 0.01;
             w_sum = r.weightSum;
             //
         }
